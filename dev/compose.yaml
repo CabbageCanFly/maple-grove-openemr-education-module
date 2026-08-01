@@ -1,0 +1,48 @@
+name: maple-grove-openemr-module-dev
+
+services:
+  mysql:
+    image: mariadb:10.11
+    restart: unless-stopped
+    command:
+      - mariadbd
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - database:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  openemr:
+    image: openemr/openemr:7.0.2
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8302:80"
+      - "127.0.0.1:9302:443"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_ROOT_PASS: root
+      MYSQL_USER: openemr
+      MYSQL_PASS: openemr
+      OE_USER: admin
+      OE_PASS: pass
+    volumes:
+      - openemr-sites:/var/www/localhost/htdocs/openemr/sites
+      - openemr-logs:/var/log
+
+      # Live module development: this repository is mounted
+      # directly into OpenEMR's custom module directory.
+      - ..:/var/www/localhost/htdocs/openemr/interface/modules/custom_modules/maple-grove-openemr-module
+
+volumes:
+  database:
+  openemr-sites:
+  openemr-logs:
