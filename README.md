@@ -229,6 +229,6 @@ This repository focuses on OpenEMR interface customization, educational workflow
 
 ## License and Attribution
 
-This project was initialized from the OpenEMR Custom Module Skeleton and retains its GNU General Public License 3 licensing requirements and applicable attribution notices.
+This project was initialized from the [OpenEMR Custom Module Skeleton](https://github.com/adunsulag/oe-module-custom-skeleton) and retains its GNU General Public License 3 licensing requirements and applicable attribution notices.
 
-OpenEMR is a separate open-source project and is not maintained by this repository.
+[OpenEMR](https://www.open-emr.org/) is a separate open-source project and is not maintained by this repository.
