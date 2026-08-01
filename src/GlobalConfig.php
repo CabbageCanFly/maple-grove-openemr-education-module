@@ -47,13 +47,13 @@ class GlobalConfig
      */
     public function isConfigured()
     {
-        $keys = [self::CONFIG_OPTION_TEXT, self::CONFIG_OPTION_ENCRYPTED];
-        foreach ($keys as $key) {
-            $value = $this->getGlobalSetting($key);
-            if (empty($value)) {
-                return false;
-            }
-        }
+        // $keys = [self::CONFIG_OPTION_TEXT, self::CONFIG_OPTION_ENCRYPTED];
+        // foreach ($keys as $key) {
+        //     $value = $this->getGlobalSetting($key);
+        //     if (empty($value)) {
+        //         return false;
+        //     }
+        // }
         return true;
     }
 
@@ -99,7 +99,7 @@ class GlobalConfig
                 ,'default' => ''
             ]
             ,self::CONFIG_ENABLE_MENU => [
-                'title' => 'Skeleton Module add module menu item'
+                'title' => 'Enable Education Dashboard menu item'
                 ,'description' => 'Shows example of adding a menu item to the system (requires logging out and logging in again)'
                 ,'type' => GlobalSetting::DATA_TYPE_BOOL
                 ,'default' => ''
