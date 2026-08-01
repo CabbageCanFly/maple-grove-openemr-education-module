@@ -1,1 +1,1 @@
-Custom Skeleton Module v1.0.0
+Maple Grove OpenEMR Education Module v0.1.0
