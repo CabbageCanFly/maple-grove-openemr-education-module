@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Shared access and event helpers for the Maple Grove education module.
+ * Shared access, event, and audit helpers for the Maple Grove education module.
  *
  * @package OpenEMR
  * @license https://github.com/openemr/openemr/blob/master/LICENSE
@@ -10,7 +10,7 @@
 
 namespace OpenEMR\Modules\CustomModuleSkeleton;
 
-
+use OpenEMR\Common\Acl\AclMain;
 
 class EducationAnalytics
 {
@@ -39,10 +39,8 @@ class EducationAnalytics
     }
 
     /**
-     * Prototype rule: any account with at least one common OpenEMR
-     * administration ACL may bootstrap and manage education analytics.
-     *
-     * This is intentionally broader than the final production rule.
+     * Prototype rule: an account with any common OpenEMR administration
+     * permission may bootstrap and manage education analytics.
      */
     public static function hasAnyAdminAccess(): bool
     {
@@ -59,7 +57,7 @@ class EducationAnalytics
         ];
 
         foreach ($adminPermissions as $permission) {
-            if (\OpenEMR\Common\Acl\AclMain::aclCheckCore('admin', $permission)) {
+            if (AclMain::aclCheckCore('admin', $permission)) {
                 return true;
             }
         }
@@ -112,7 +110,7 @@ class EducationAnalytics
     }
 
     /**
-     * Record a meaningful event for a tracked student.
+     * Record an education-module event for a tracked student.
      *
      * Identical event types can optionally be throttled to reduce noise.
      */
@@ -181,10 +179,120 @@ class EducationAnalytics
     }
 
     /**
-     * Convert an event key into a readable label.
+     * SQL condition for successful audit rows that map to meaningful actions.
+     *
+     * Patient read events are included only when OpenEMR identifies an actual
+     * patient. This removes recurring patient-demographics polling rows with
+     * patient_id = 0 from the normal education dashboard.
+     */
+    public static function meaningfulAuditCondition(string $alias = 'audit'): string
+    {
+        return "{$alias}.success = 1 AND (
+            " . self::meaningfulDiscreteAuditCondition($alias, false) . "
+            OR " . self::patientChartAuditCondition($alias, false) . "
+        )";
+    }
+
+    /**
+     * SQL condition for meaningful actions other than patient chart reads.
+     */
+    public static function meaningfulDiscreteAuditCondition(
+        string $alias = 'audit',
+        bool $includeSuccess = true
+    ): string {
+        $condition = "(
+            {$alias}.event IN (
+                'login',
+                'logout',
+                'esign',
+                'print',
+                'patient-record-insert',
+                'patient-record-update',
+                'patient-record-delete',
+                'patient-record-replace',
+                'scheduling-insert',
+                'scheduling-update',
+                'scheduling-delete'
+            )
+        )";
+
+        return $includeSuccess
+            ? "{$alias}.success = 1 AND {$condition}"
+            : $condition;
+    }
+
+    /**
+     * SQL condition for patient chart reads tied to an actual patient.
+     */
+    public static function patientChartAuditCondition(
+        string $alias = 'audit',
+        bool $includeSuccess = true
+    ): string {
+        $condition = "(
+            {$alias}.patient_id > 0
+            AND {$alias}.event IN (
+                'patient-record-select',
+                'patient-access'
+            )
+        )";
+
+        return $includeSuccess
+            ? "{$alias}.success = 1 AND {$condition}"
+            : $condition;
+    }
+
+    /**
+     * Convert a module event key into a readable label.
      */
     public static function formatEventType(string $eventType): string
     {
         return ucwords(str_replace('_', ' ', $eventType));
+    }
+
+    /**
+     * Convert an OpenEMR audit event/category pair into a readable label.
+     */
+    public static function formatAuditEvent(
+        string $event,
+        string $category = ''
+    ): string {
+        $category = trim($category);
+        $categoryLabel = $category !== '' ? $category : 'Patient Record';
+
+        $labels = [
+            'login' => 'Logged In',
+            'logout' => 'Logged Out',
+            'patient-access' => 'Accessed Patient Record',
+            'patient-chart-session' => 'Patient Chart Session',
+            'esign' => 'E-Signed Record',
+            'print' => 'Printed or Exported Record',
+            'scheduling-insert' => 'Created Appointment',
+            'scheduling-update' => 'Updated Appointment',
+            'scheduling-delete' => 'Deleted Appointment'
+        ];
+
+        if (isset($labels[$event])) {
+            return $labels[$event];
+        }
+
+        $patientPrefixes = [
+            'patient-record-select' => 'Viewed',
+            'patient-record-insert' => 'Created',
+            'patient-record-update' => 'Updated',
+            'patient-record-delete' => 'Deleted',
+            'patient-record-replace' => 'Replaced'
+        ];
+
+        if (isset($patientPrefixes[$event])) {
+            return $patientPrefixes[$event] . ' ' . $categoryLabel;
+        }
+
+        $eventLabel = ucwords(str_replace(['-', '_'], ' ', $event));
+
+        if ($category !== '' && strcasecmp($eventLabel, $category) !== 0) {
+            return $eventLabel . ' — ' . $category;
+        }
+
+        return $eventLabel;
     }
 }
