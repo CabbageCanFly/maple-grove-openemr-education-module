@@ -28,7 +28,7 @@ use OpenEMR\Core\Header;
 <body class="body_top">
 <div class="container-fluid mt-3">
 
-    <div class="d-flex justify-content-between align-items-start mb-4">
+    <div class="d-flex flex-wrap justify-content-between align-items-start mb-4">
         <div>
             <h1 class="h3 mb-1">
                 <?php echo xlt("Maple Grove Education Dashboard"); ?>
@@ -39,9 +39,18 @@ use OpenEMR\Core\Header;
             </p>
         </div>
 
-        <span class="badge badge-secondary p-2">
-            Prototype
-        </span>
+        <div class="mt-2 mt-md-0">
+            <a
+                class="btn btn-outline-primary mr-2"
+                href="manage-education-users.php"
+            >
+                <?php echo xlt("Manage Education Users"); ?>
+            </a>
+
+            <span class="badge badge-secondary p-2">
+                Prototype
+            </span>
+        </div>
     </div>
 
     <div class="row">
