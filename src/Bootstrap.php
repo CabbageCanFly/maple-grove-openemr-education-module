@@ -206,12 +206,13 @@ class Bootstrap
 
         $menuItem = new \stdClass();
         $menuItem->requirement = 0;
-        $menuItem->target = 'mod';
-        $menuItem->menu_id = 'mod0';
-        $menuItem->label = xlt("Custom Module Skeleton");
+        $menuItem->target = 'maple_grove_education';
+        $menuItem->menu_id = 'maple_grove_education_dashboard';
+        $menuItem->label = xlt("Education Dashboard");
         // TODO: pull the install location into a constant into the codebase so if OpenEMR changes this location it
         // doesn't break any modules.
-        $menuItem->url = "/interface/modules/custom_modules/oe-module-custom-skeleton/public/sample-index.php";
+        // $menuItem->url = "/interface/modules/custom_modules/oe-module-custom-skeleton/public/sample-index.php";
+        $menuItem->url = $this->getPublicPath() . "education-dashboard.php";
         $menuItem->children = [];
 
         /**
