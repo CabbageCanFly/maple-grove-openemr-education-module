@@ -61,7 +61,7 @@ if ($canManageEducation) {
          FROM users
          WHERE username <> ''
            AND username <> 'oe-system'
-         ORDER BY active DESC, lname, fname, username"
+         ORDER BY username ASC"
     );
 
     while ($row = sqlFetchArray($userStatement)) {
@@ -298,17 +298,23 @@ if ($canManageEducation) {
                     <div class="d-flex flex-wrap justify-content-between align-items-center">
                         <strong><?php echo xlt('OpenEMR Accounts'); ?></strong>
 
-                        <div class="mt-2 mt-md-0">
+                        <div class="mt-2 mt-md-0 d-flex flex-wrap align-items-center">
+                            <button
+                                type="submit"
+                                class="btn btn-sm btn-primary mr-2 mb-1"
+                            >
+                                <?php echo xlt('Save Education Users'); ?>
+                            </button>
                             <button
                                 type="button"
-                                class="btn btn-sm btn-outline-primary mr-1"
+                                class="btn btn-sm btn-outline-primary mr-1 mb-1"
                                 onclick="setVisibleStudentTracking(true)"
                             >
                                 <?php echo xlt('Select Visible Students'); ?>
                             </button>
                             <button
                                 type="button"
-                                class="btn btn-sm btn-outline-secondary"
+                                class="btn btn-sm btn-outline-secondary mb-1"
                                 onclick="setVisibleStudentTracking(false)"
                             >
                                 <?php echo xlt('Clear Visible Students'); ?>
