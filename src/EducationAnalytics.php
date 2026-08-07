@@ -100,6 +100,16 @@ class EducationAnalytics
     }
 
     /**
+     * Determine whether the current OpenEMR user may view patient demographics.
+     * Patient names and chart links in analytics are only exposed when this
+     * native OpenEMR ACL is present.
+     */
+    public static function canViewPatientDemographics(): bool
+    {
+        return AclMain::aclCheckCore('patients', 'demo');
+    }
+
+    /**
      * Determine whether a user is selected for student activity tracking.
      */
     public static function isTrackedStudent(int $userId): bool

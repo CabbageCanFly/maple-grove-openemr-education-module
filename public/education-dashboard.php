@@ -20,6 +20,7 @@ $educationUser = EducationAnalytics::getEducationUser($currentUserId);
 
 $isTrackedStudent = !empty($educationUser['track_activity']);
 $canManageEducation = EducationAnalytics::canManageEducation($currentUserId);
+$canViewPatientDemographics = EducationAnalytics::canViewPatientDemographics();
 
 EducationAnalytics::recordTrackedEvent(
     $currentUserId,
@@ -142,8 +143,66 @@ $effectiveAuditCondition = $scopeKey === 'all'
  */
 function normalizeRecentAuditRows(array $rows, string $scopeKey): array
 {
+    if ($scopeKey === 'all') {
+        $activities = [];
+
+        foreach ($rows as $row) {
+            $event = (string) ($row['event'] ?? '');
+            $category = trim((string) ($row['category'] ?? ''));
+            $patientId = (int) ($row['patient_id'] ?? 0);
+            $date = (string) ($row['date'] ?? '');
+            $timestamp = strtotime($date . ' UTC');
+
+            if ($date === '' || $timestamp === false) {
+                continue;
+            }
+
+            $bucket = intdiv($timestamp, 300);
+            $key = implode('|', [
+                'raw',
+                $event,
+                $category,
+                (string) $patientId,
+                (string) $bucket
+            ]);
+
+            if (!isset($activities[$key])) {
+                $activities[$key] = [
+                    'user' => (string) ($row['user'] ?? ''),
+                    'event' => $event,
+                    'category' => $category,
+                    'patient_id' => $patientId,
+                    'session_start' => $date,
+                    'date' => $date,
+                    'repeated_count' => 1
+                ];
+            } else {
+                $activities[$key]['repeated_count']++;
+
+                if ($date < $activities[$key]['session_start']) {
+                    $activities[$key]['session_start'] = $date;
+                }
+
+                if ($date > $activities[$key]['date']) {
+                    $activities[$key]['date'] = $date;
+                }
+            }
+        }
+
+        $activities = array_values($activities);
+
+        usort(
+            $activities,
+            static function (array $left, array $right): int {
+                return strcmp($right['date'], $left['date']);
+            }
+        );
+
+        return $activities;
+    }
+
     $activities = [];
-    $creationTimesByPatient = [];
+    $chartRowsByPatient = [];
 
     foreach ($rows as $row) {
         $event = (string) ($row['event'] ?? '');
@@ -156,70 +215,58 @@ function normalizeRecentAuditRows(array $rows, string $scopeKey): array
             continue;
         }
 
-        if ($scopeKey === 'all') {
-            $bucket = intdiv($timestamp, 300);
+        if (
+            in_array($event, ['patient-record-select', 'patient-access'], true)
+        ) {
+            if ($patientId > 0) {
+                $chartRowsByPatient[$patientId][] = $row;
+            }
+
+            continue;
+        }
+
+        $isCreationBundle =
+            $event === 'patient-record-insert'
+            && in_array(
+                $category,
+                [
+                    'Patient Demographics',
+                    'Patient Insurance',
+                    'Social and Family History'
+                ],
+                true
+            );
+
+        if ($isCreationBundle) {
+            $bucket = intdiv($timestamp, 10);
+            $key = 'patient-create|' . $bucket;
+            $event = 'patient-record-insert';
+            $category = 'Patient Record';
+        } else {
+            if (
+                in_array(
+                    $event,
+                    [
+                        'patient-record-insert',
+                        'patient-record-update',
+                        'patient-record-delete',
+                        'patient-record-replace'
+                    ],
+                    true
+                )
+                && $patientId <= 0
+            ) {
+                continue;
+            }
+
+            $bucket = intdiv($timestamp, 60);
             $key = implode('|', [
-                'raw',
+                'activity',
                 $event,
                 $category,
                 (string) $patientId,
                 (string) $bucket
             ]);
-        } else {
-            $isCreationBundle =
-                $event === 'patient-record-insert'
-                && in_array(
-                    $category,
-                    [
-                        'Patient Demographics',
-                        'Patient Insurance',
-                        'Social and Family History'
-                    ],
-                    true
-                );
-
-            if ($isCreationBundle) {
-                $bucket = intdiv($timestamp, 10);
-                $key = 'patient-create|' . $bucket;
-                $event = 'patient-record-insert';
-                $category = 'Patient Record';
-            } elseif (
-                in_array($event, ['patient-record-select', 'patient-access'], true)
-            ) {
-                if ($patientId <= 0) {
-                    continue;
-                }
-
-                $bucket = intdiv($timestamp, 1800);
-                $key = 'patient-chart|' . $patientId . '|' . $bucket;
-                $event = 'patient-chart-session';
-                $category = 'Patient Chart';
-            } else {
-                if (
-                    in_array(
-                        $event,
-                        [
-                            'patient-record-insert',
-                            'patient-record-update',
-                            'patient-record-delete',
-                            'patient-record-replace'
-                        ],
-                        true
-                    )
-                    && $patientId <= 0
-                ) {
-                    continue;
-                }
-
-                $bucket = intdiv($timestamp, 60);
-                $key = implode('|', [
-                    'activity',
-                    $event,
-                    $category,
-                    (string) $patientId,
-                    (string) $bucket
-                ]);
-            }
         }
 
         if (!isset($activities[$key])) {
@@ -252,37 +299,90 @@ function normalizeRecentAuditRows(array $rows, string $scopeKey): array
         }
     }
 
-    if ($scopeKey === 'meaningful') {
-        foreach ($activities as $activity) {
-            if (
-                $activity['event'] === 'patient-record-insert'
-                && $activity['category'] === 'Patient Record'
-                && (int) $activity['patient_id'] > 0
-            ) {
-                $creationTimesByPatient[(int) $activity['patient_id']][] =
-                    strtotime($activity['date'] . ' UTC');
+    foreach ($chartRowsByPatient as $rowsForPatient) {
+        usort(
+            $rowsForPatient,
+            static function (array $left, array $right): int {
+                return strcmp((string) $right['date'], (string) $left['date']);
             }
-        }
+        );
 
-        foreach ($activities as $key => $activity) {
-            if ($activity['event'] !== 'patient-chart-session') {
+        $session = null;
+        $oldestTimestamp = null;
+
+        foreach ($rowsForPatient as $row) {
+            $date = (string) ($row['date'] ?? '');
+            $timestamp = strtotime($date . ' UTC');
+
+            if ($date === '' || $timestamp === false) {
                 continue;
             }
 
-            $patientId = (int) $activity['patient_id'];
-            $sessionStart = strtotime($activity['session_start'] . ' UTC');
-            $sessionEnd = strtotime($activity['date'] . ' UTC');
-
-            foreach ($creationTimesByPatient[$patientId] ?? [] as $createdAt) {
-                if (
-                    $sessionStart !== false
-                    && $sessionEnd !== false
-                    && $createdAt >= ($sessionStart - 60)
-                    && $createdAt <= ($sessionEnd + 60)
-                ) {
-                    unset($activities[$key]);
-                    break;
+            if (
+                $session === null
+                || $oldestTimestamp === null
+                || ($oldestTimestamp - $timestamp) > 1800
+            ) {
+                if ($session !== null) {
+                    $activities[] = $session;
                 }
+
+                $session = [
+                    'user' => (string) ($row['user'] ?? ''),
+                    'event' => 'patient-chart-session',
+                    'category' => 'Patient Chart',
+                    'patient_id' => (int) ($row['patient_id'] ?? 0),
+                    'session_start' => $date,
+                    'date' => $date,
+                    'repeated_count' => 1
+                ];
+                $oldestTimestamp = $timestamp;
+                continue;
+            }
+
+            $session['session_start'] = $date;
+            $session['repeated_count']++;
+            $oldestTimestamp = $timestamp;
+        }
+
+        if ($session !== null) {
+            $activities[] = $session;
+        }
+    }
+
+    $activities = array_values($activities);
+    $creationTimesByPatient = [];
+
+    foreach ($activities as $activity) {
+        if (
+            $activity['event'] === 'patient-record-insert'
+            && $activity['category'] === 'Patient Record'
+            && (int) $activity['patient_id'] > 0
+        ) {
+            $creationTimesByPatient[(int) $activity['patient_id']][] =
+                strtotime($activity['date'] . ' UTC');
+        }
+    }
+
+    foreach ($activities as $key => $activity) {
+        if ($activity['event'] !== 'patient-chart-session') {
+            continue;
+        }
+
+        $patientId = (int) $activity['patient_id'];
+        $sessionStart = strtotime($activity['session_start'] . ' UTC');
+        $sessionEnd = strtotime($activity['date'] . ' UTC');
+
+        foreach ($creationTimesByPatient[$patientId] ?? [] as $createdAt) {
+            if (
+                $sessionStart !== false
+                && $sessionEnd !== false
+                && $createdAt !== false
+                && $createdAt >= ($sessionStart - 60)
+                && $createdAt <= ($sessionEnd + 60)
+            ) {
+                unset($activities[$key]);
+                break;
             }
         }
     }
@@ -861,11 +961,118 @@ if (
     }
 }
 
-function renderAuditPatient($patientId): string
+$patientDirectoryActivities = [];
+
+if ($canManageEducation) {
+    $patientDirectoryActivities = $recentCohortAudit;
+
+    if ($lastCohortAudit) {
+        $patientDirectoryActivities[] = $lastCohortAudit;
+    }
+} elseif ($isTrackedStudent) {
+    $patientDirectoryActivities = $myRecentAudit;
+
+    if ($myLastAudit) {
+        $patientDirectoryActivities[] = $myLastAudit;
+    }
+}
+
+$patientDirectory = $canViewPatientDemographics
+    ? loadPatientDirectory($patientDirectoryActivities)
+    : [];
+
+function loadPatientDirectory(array $activities): array
 {
+    $patientIds = [];
+
+    foreach ($activities as $activity) {
+        $patientId = (int) ($activity['patient_id'] ?? 0);
+
+        if ($patientId > 0) {
+            $patientIds[$patientId] = $patientId;
+        }
+    }
+
+    if (empty($patientIds)) {
+        return [];
+    }
+
+    $patientIds = array_values($patientIds);
+    $placeholders = implode(',', array_fill(0, count($patientIds), '?'));
+    $statement = sqlStatement(
+        "SELECT pid, pubpid, fname, mname, lname
+         FROM patient_data
+         WHERE pid IN ({$placeholders})",
+        $patientIds
+    );
+
+    $directory = [];
+
+    while ($row = sqlFetchArray($statement)) {
+        $pid = (int) ($row['pid'] ?? 0);
+
+        if ($pid <= 0) {
+            continue;
+        }
+
+        $nameParts = array_filter(
+            [
+                trim((string) ($row['fname'] ?? '')),
+                trim((string) ($row['mname'] ?? '')),
+                trim((string) ($row['lname'] ?? ''))
+            ],
+            static fn(string $part): bool => $part !== ''
+        );
+
+        $directory[$pid] = [
+            'name' => trim(implode(' ', $nameParts)),
+            'pubpid' => trim((string) ($row['pubpid'] ?? ''))
+        ];
+    }
+
+    return $directory;
+}
+
+function renderAuditPatient(
+    $patientId,
+    array $patientDirectory,
+    bool $canViewPatientDemographics
+): string {
     $patientId = (int) $patientId;
 
-    return $patientId > 0 ? (string) $patientId : '—';
+    if ($patientId <= 0) {
+        return text('—');
+    }
+
+    if (
+        !$canViewPatientDemographics
+        || !isset($patientDirectory[$patientId])
+    ) {
+        return text('PID ' . $patientId);
+    }
+
+    $patient = $patientDirectory[$patientId];
+    $name = trim((string) ($patient['name'] ?? ''));
+    $pubpid = trim((string) ($patient['pubpid'] ?? ''));
+
+    if ($name === '') {
+        $name = 'Patient ' . $patientId;
+    }
+
+    $url = '../../../../patient_file/summary/demographics.php?set_pid='
+        . rawurlencode((string) $patientId);
+
+    $secondaryId = $pubpid !== ''
+        ? 'ID ' . $pubpid
+        : 'PID ' . $patientId;
+
+    return '<a href="' . attr($url) . '"'
+        . ' onclick="return openPatientDashboard(' . $patientId . ', this.href);">'
+        . text($name)
+        . '</a>'
+        . '<small class="text-muted d-block">'
+        . text($secondaryId)
+        . '</small>';
 }
 
 function renderAuditTime(array $event): string
@@ -946,6 +1153,16 @@ function renderAuditTime(array $event): string
         </div>
 
         <div class="mt-2 mt-md-0">
+            <?php if ($canManageEducation || $isTrackedStudent) : ?>
+                <a
+                    class="btn btn-primary mr-2"
+                    href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                    onclick="showDashboardLoading()"
+                >
+                    <?php echo xlt('Explore Activity'); ?>
+                </a>
+            <?php endif; ?>
+
             <?php if ($canManageEducation) : ?>
                 <a
                     class="btn btn-outline-primary mr-2"
@@ -1073,11 +1290,16 @@ function renderAuditTime(array $event): string
                 <div class="card shadow-sm h-100">
                     <div class="card-body">
                         <h3 class="h6 text-muted">
-                            <?php echo xlt($scopeKey === 'meaningful' ? 'Meaningful Activities' : 'Audit Rows'); ?>
+                            <?php echo xlt($scopeKey === 'meaningful' ? 'Meaningful Activity Events' : 'Audit Rows'); ?>
                         </h3>
                         <div class="display-4">
                             <?php echo text((string) $auditEventsCount); ?>
                         </div>
+                        <?php if ($scopeKey === 'meaningful') : ?>
+                            <p class="mb-0 text-muted">
+                                Normalized activity; logins and logouts count separately.
+                            </p>
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -1105,7 +1327,7 @@ function renderAuditTime(array $event): string
                             <?php echo text((string) $patientChartSessions); ?>
                         </div>
                         <p class="mb-0 text-muted">
-                            Distinct student/patient activity grouped into 30-minute blocks.
+                            Approximate chart-activity blocks for the same student and patient.
                         </p>
                     </div>
                 </div>
@@ -1177,10 +1399,11 @@ function renderAuditTime(array $event): string
                     <p class="mb-0 text-muted">
                         <?php echo text($lastCohortAudit['date']); ?>
                         <?php if ((int) $lastCohortAudit['patient_id'] > 0) : ?>
-                            · Patient ID
-                            <?php
-                            echo text(
-                                (string) $lastCohortAudit['patient_id']
+                            · <?php
+                            echo renderAuditPatient(
+                                $lastCohortAudit['patient_id'],
+                                $patientDirectory,
+                                $canViewPatientDemographics
                             );
                             ?>
                         <?php endif; ?>
@@ -1196,14 +1419,21 @@ function renderAuditTime(array $event): string
         <div class="row">
             <div class="col-xl-8 mb-3">
                 <div class="card shadow-sm h-100">
-                    <div class="card-header">
+                    <div class="card-header d-flex flex-wrap justify-content-between align-items-center">
                         <strong>
                             <?php
                             echo text(
-                                'Recent OpenEMR Activity — ' . $rangeLabel
+                                'Recent Activity Preview — ' . $rangeLabel
                             );
                             ?>
                         </strong>
+                        <a
+                            class="btn btn-sm btn-outline-primary mt-1 mt-sm-0"
+                            href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                            onclick="showDashboardLoading()"
+                        >
+                            <?php echo xlt('Browse All Activity'); ?>
+                        </a>
                     </div>
 
                     <?php if (empty($recentCohortAudit)) : ?>
@@ -1217,7 +1447,7 @@ function renderAuditTime(array $event): string
                                 <tr>
                                     <th><?php echo xlt('Username'); ?></th>
                                     <th><?php echo xlt('Activity'); ?></th>
-                                    <th><?php echo xlt('Patient ID'); ?></th>
+                                    <th><?php echo xlt('Patient'); ?></th>
                                     <th><?php echo xlt('Time'); ?></th>
                                     <?php if ($scopeKey === 'all') : ?>
                                         <th><?php echo xlt('Grouped Rows'); ?></th>
@@ -1244,10 +1474,10 @@ function renderAuditTime(array $event): string
                                         </td>
                                         <td>
                                             <?php
-                                            echo text(
-                                                renderAuditPatient(
-                                                    $event['patient_id']
-                                                )
+                                            echo renderAuditPatient(
+                                                $event['patient_id'],
+                                                $patientDirectory,
+                                                $canViewPatientDemographics
                                             );
                                             ?>
                                         </td>
@@ -1335,7 +1565,7 @@ function renderAuditTime(array $event): string
                 <div class="card shadow-sm h-100">
                     <div class="card-body">
                         <h3 class="h6 text-muted">
-                            <?php echo xlt($scopeKey === 'meaningful' ? 'Meaningful Activities' : 'Audit Rows'); ?>
+                            <?php echo xlt($scopeKey === 'meaningful' ? 'Meaningful Activity Events' : 'Audit Rows'); ?>
                         </h3>
                         <div class="display-4">
                             <?php echo text((string) $myAuditEvents); ?>
@@ -1417,8 +1647,13 @@ function renderAuditTime(array $event): string
                     <p class="mb-0 text-muted">
                         <?php echo text($myLastAudit['date']); ?>
                         <?php if ((int) $myLastAudit['patient_id'] > 0) : ?>
-                            · Patient ID
-                            <?php echo text((string) $myLastAudit['patient_id']); ?>
+                            · <?php
+                            echo renderAuditPatient(
+                                $myLastAudit['patient_id'],
+                                $patientDirectory,
+                                $canViewPatientDemographics
+                            );
+                            ?>
                         <?php endif; ?>
                     </p>
                 <?php else : ?>
@@ -1430,10 +1665,17 @@ function renderAuditTime(array $event): string
         </div>
 
         <div class="card shadow-sm">
-            <div class="card-header">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center">
                 <strong>
-                    <?php echo text('My Recent Activity — ' . $rangeLabel); ?>
+                    <?php echo text('My Recent Activity Preview — ' . $rangeLabel); ?>
                 </strong>
+                <a
+                    class="btn btn-sm btn-outline-primary mt-1 mt-sm-0"
+                    href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                    onclick="showDashboardLoading()"
+                >
+                    <?php echo xlt('Browse All Activity'); ?>
+                </a>
             </div>
 
             <?php if (empty($myRecentAudit)) : ?>
@@ -1446,7 +1688,7 @@ function renderAuditTime(array $event): string
                         <thead>
                         <tr>
                             <th><?php echo xlt('Activity'); ?></th>
-                            <th><?php echo xlt('Patient ID'); ?></th>
+                            <th><?php echo xlt('Patient'); ?></th>
                             <th><?php echo xlt('Time'); ?></th>
                             <?php if ($scopeKey === 'all') : ?>
                                 <th><?php echo xlt('Grouped Rows'); ?></th>
@@ -1468,10 +1710,10 @@ function renderAuditTime(array $event): string
                                 </td>
                                 <td>
                                     <?php
-                                    echo text(
-                                        renderAuditPatient(
-                                            $event['patient_id']
-                                        )
+                                    echo renderAuditPatient(
+                                        $event['patient_id'],
+                                        $patientDirectory,
+                                        $canViewPatientDemographics
                                     );
                                     ?>
                                 </td>
@@ -1505,6 +1747,34 @@ function renderAuditTime(array $event): string
 </div>
 
 <script>
+function openPatientDashboard(patientId, fallbackUrl) {
+    if (top.restoreSession) {
+        top.restoreSession();
+    }
+
+    const patientDashboardUrl =
+        'patient_file/summary/demographics.php?set_pid='
+        + encodeURIComponent(String(patientId));
+
+    const leftNav =
+        top.left_nav && typeof top.left_nav.loadFrame === 'function'
+            ? top.left_nav
+            : (
+                parent.left_nav
+                && typeof parent.left_nav.loadFrame === 'function'
+                    ? parent.left_nav
+                    : null
+            );
+
+    if (leftNav) {
+        leftNav.loadFrame('dem1', 'RTop', patientDashboardUrl);
+        return false;
+    }
+
+    window.location.href = fallbackUrl;
+    return false;
+}
+
 function showDashboardLoading() {
     const overlay = document.getElementById("dashboard-loading-overlay");
 
