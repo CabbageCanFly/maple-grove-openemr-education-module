@@ -134,6 +134,171 @@ $effectiveAuditCondition = $scopeKey === 'all'
         OR ({$patientCreationBundleCondition})
     )";
 
+/**
+ * Build a small, human-readable activity feed from a bounded set of recent
+ * audit rows. This intentionally happens in PHP so the database does not have
+ * to GROUP BY calculated time buckets across the entire audit history just to
+ * render the recent-activity table.
+ */
+function normalizeRecentAuditRows(array $rows, string $scopeKey): array
+{
+    $activities = [];
+    $creationTimesByPatient = [];
+
+    foreach ($rows as $row) {
+        $event = (string) ($row['event'] ?? '');
+        $category = trim((string) ($row['category'] ?? ''));
+        $patientId = (int) ($row['patient_id'] ?? 0);
+        $date = (string) ($row['date'] ?? '');
+        $timestamp = strtotime($date . ' UTC');
+
+        if ($date === '' || $timestamp === false) {
+            continue;
+        }
+
+        if ($scopeKey === 'all') {
+            $bucket = intdiv($timestamp, 300);
+            $key = implode('|', [
+                'raw',
+                $event,
+                $category,
+                (string) $patientId,
+                (string) $bucket
+            ]);
+        } else {
+            $isCreationBundle =
+                $event === 'patient-record-insert'
+                && in_array(
+                    $category,
+                    [
+                        'Patient Demographics',
+                        'Patient Insurance',
+                        'Social and Family History'
+                    ],
+                    true
+                );
+
+            if ($isCreationBundle) {
+                $bucket = intdiv($timestamp, 10);
+                $key = 'patient-create|' . $bucket;
+                $event = 'patient-record-insert';
+                $category = 'Patient Record';
+            } elseif (
+                in_array($event, ['patient-record-select', 'patient-access'], true)
+            ) {
+                if ($patientId <= 0) {
+                    continue;
+                }
+
+                $bucket = intdiv($timestamp, 1800);
+                $key = 'patient-chart|' . $patientId . '|' . $bucket;
+                $event = 'patient-chart-session';
+                $category = 'Patient Chart';
+            } else {
+                if (
+                    in_array(
+                        $event,
+                        [
+                            'patient-record-insert',
+                            'patient-record-update',
+                            'patient-record-delete',
+                            'patient-record-replace'
+                        ],
+                        true
+                    )
+                    && $patientId <= 0
+                ) {
+                    continue;
+                }
+
+                $bucket = intdiv($timestamp, 60);
+                $key = implode('|', [
+                    'activity',
+                    $event,
+                    $category,
+                    (string) $patientId,
+                    (string) $bucket
+                ]);
+            }
+        }
+
+        if (!isset($activities[$key])) {
+            $activities[$key] = [
+                'user' => (string) ($row['user'] ?? ''),
+                'event' => $event,
+                'category' => $category,
+                'patient_id' => $patientId,
+                'session_start' => $date,
+                'date' => $date,
+                'repeated_count' => 1
+            ];
+        } else {
+            $activities[$key]['repeated_count']++;
+
+            if ($date < $activities[$key]['session_start']) {
+                $activities[$key]['session_start'] = $date;
+            }
+
+            if ($date > $activities[$key]['date']) {
+                $activities[$key]['date'] = $date;
+            }
+
+            if (
+                $activities[$key]['patient_id'] <= 0
+                && $patientId > 0
+            ) {
+                $activities[$key]['patient_id'] = $patientId;
+            }
+        }
+    }
+
+    if ($scopeKey === 'meaningful') {
+        foreach ($activities as $activity) {
+            if (
+                $activity['event'] === 'patient-record-insert'
+                && $activity['category'] === 'Patient Record'
+                && (int) $activity['patient_id'] > 0
+            ) {
+                $creationTimesByPatient[(int) $activity['patient_id']][] =
+                    strtotime($activity['date'] . ' UTC');
+            }
+        }
+
+        foreach ($activities as $key => $activity) {
+            if ($activity['event'] !== 'patient-chart-session') {
+                continue;
+            }
+
+            $patientId = (int) $activity['patient_id'];
+            $sessionStart = strtotime($activity['session_start'] . ' UTC');
+            $sessionEnd = strtotime($activity['date'] . ' UTC');
+
+            foreach ($creationTimesByPatient[$patientId] ?? [] as $createdAt) {
+                if (
+                    $sessionStart !== false
+                    && $sessionEnd !== false
+                    && $createdAt >= ($sessionStart - 60)
+                    && $createdAt <= ($sessionEnd + 60)
+                ) {
+                    unset($activities[$key]);
+                    break;
+                }
+            }
+        }
+    }
+
+    $activities = array_values($activities);
+
+    usort(
+        $activities,
+        static function (array $left, array $right): int {
+            return strcmp($right['date'], $left['date']);
+        }
+    );
+
+    return $activities;
+}
+
 $trackedStudentCount = 0;
 $activeStudentCount = 0;
 $auditEventsCount = 0;
@@ -147,273 +312,219 @@ $recentCohortAudit = [];
 $auditBreakdown = [];
 
 if ($canManageEducation) {
-    $trackedStudentRow = sqlQuery(
-        "SELECT COUNT(*) AS total
+    $trackedStudents = [];
+    $trackedStudentStatement = sqlStatement(
+        "SELECT username
          FROM mod_maple_grove_education_users
-         WHERE track_activity = 1"
+         WHERE track_activity = 1
+         ORDER BY username"
     );
 
-    $trackedStudentCount = (int) ($trackedStudentRow['total'] ?? 0);
+    while ($row = sqlFetchArray($trackedStudentStatement)) {
+        $username = trim((string) ($row['username'] ?? ''));
 
-    $activeStudentRow = sqlQuery(
-        "SELECT COUNT(DISTINCT audit.user) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND {$effectiveAuditCondition}
-           AND {$auditRangeCondition}"
+        if ($username !== '') {
+            $trackedStudents[] = $username;
+        }
+    }
+
+    $trackedStudentCount = count($trackedStudents);
+
+    $cacheKey = hash(
+        'sha256',
+        implode('|', $trackedStudents) . '|' . $rangeKey . '|' . $scopeKey
     );
+    $cacheTtlSeconds = 60;
+    $cachedAnalytics = $_SESSION['maple_grove_education_analytics_cache'][$cacheKey] ?? null;
 
-    $activeStudentCount = (int) ($activeStudentRow['total'] ?? 0);
+    if (
+        is_array($cachedAnalytics)
+        && isset($cachedAnalytics['cached_at'])
+        && (time() - (int) $cachedAnalytics['cached_at']) <= $cacheTtlSeconds
+    ) {
+        $activeStudentCount = (int) $cachedAnalytics['activeStudentCount'];
+        $auditEventsCount = (int) $cachedAnalytics['auditEventsCount'];
+        $loginCount = (int) $cachedAnalytics['loginCount'];
+        $patientChartSessions = (int) $cachedAnalytics['patientChartSessions'];
+        $clinicalChangeCount = (int) $cachedAnalytics['clinicalChangeCount'];
+        $schedulingChangeCount = (int) $cachedAnalytics['schedulingChangeCount'];
+        $moduleEventsCount = (int) $cachedAnalytics['moduleEventsCount'];
+        $lastCohortAudit = $cachedAnalytics['lastCohortAudit'];
+        $recentCohortAudit = $cachedAnalytics['recentCohortAudit'];
+        $auditBreakdown = $cachedAnalytics['auditBreakdown'];
+    } else {
+        /*
+         * One broad aggregate scan replaces several separate COUNT queries.
+         * The user/date and date/user indexes added for this module make the
+         * range and tracked-user filtering substantially cheaper.
+         */
+        $summaryRow = sqlQuery(
+            "SELECT
+                COUNT(DISTINCT audit.user) AS active_students,
+                COUNT(*) AS raw_rows,
+                SUM(CASE WHEN audit.event = 'login' THEN 1 ELSE 0 END) AS logins,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN ({$meaningfulNonCreationCondition}) THEN CONCAT_WS(
+                            '|',
+                            audit.user,
+                            audit.event,
+                            audit.category,
+                            audit.patient_id,
+                            FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
+                        )
+                        ELSE NULL
+                    END
+                ) AS discrete_activities,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN ({$patientCreationBundleCondition}) THEN CONCAT_WS(
+                            '|',
+                            audit.user,
+                            FLOOR(UNIX_TIMESTAMP(audit.date) / 10)
+                        )
+                        ELSE NULL
+                    END
+                ) AS patient_creations,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN audit.event IN (
+                            'patient-record-insert',
+                            'patient-record-update',
+                            'patient-record-delete',
+                            'patient-record-replace'
+                        )
+                        AND NOT ({$patientCreationBundleCondition})
+                        AND audit.patient_id > 0
+                        THEN CONCAT_WS(
+                            '|',
+                            audit.user,
+                            audit.event,
+                            audit.category,
+                            audit.patient_id,
+                            FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
+                        )
+                        ELSE NULL
+                    END
+                ) AS clinical_changes,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN audit.event IN (
+                            'scheduling-insert',
+                            'scheduling-update',
+                            'scheduling-delete'
+                        )
+                        THEN CONCAT_WS(
+                            '|',
+                            audit.user,
+                            audit.event,
+                            audit.patient_id,
+                            FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
+                        )
+                        ELSE NULL
+                    END
+                ) AS scheduling_changes
+             FROM log AS audit
+             INNER JOIN mod_maple_grove_education_users AS education_users
+                 ON education_users.username = audit.user
+             WHERE education_users.track_activity = 1
+               AND audit.success = 1
+               AND {$auditRangeCondition}"
+        );
 
-    $auditEventsRow = sqlQuery(
-        "SELECT COUNT(*) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND {$auditScopeCondition}
-           AND {$auditRangeCondition}"
-    );
+        $activeStudentCount = (int) ($summaryRow['active_students'] ?? 0);
+        $loginCount = (int) ($summaryRow['logins'] ?? 0);
+        $patientCreationCount = (int) ($summaryRow['patient_creations'] ?? 0);
+        $clinicalChangeCount =
+            (int) ($summaryRow['clinical_changes'] ?? 0)
+            + $patientCreationCount;
+        $schedulingChangeCount = (int) ($summaryRow['scheduling_changes'] ?? 0);
 
-    $auditEventsCount = (int) ($auditEventsRow['total'] ?? 0);
-
-    $loginRow = sqlQuery(
-        "SELECT COUNT(*) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND audit.success = 1
-           AND audit.event = 'login'
-           AND {$auditRangeCondition}"
-    );
-
-    $loginCount = (int) ($loginRow['total'] ?? 0);
-
-    $patientSessionsRow = sqlQuery(
-        "SELECT COUNT(
-            DISTINCT CONCAT_WS(
-                '|',
-                audit.user,
-                audit.patient_id,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 1800)
-            )
-         ) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND {$meaningfulPatientChartCondition}
-           AND {$auditRangeCondition}"
-    );
-
-    $patientChartSessions = (int) ($patientSessionsRow['total'] ?? 0);
-
-    $patientCreationRow = sqlQuery(
-        "SELECT COUNT(
-            DISTINCT CONCAT_WS(
-                '|',
-                audit.user,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 10)
-            )
-         ) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND {$patientCreationBundleCondition}
-           AND {$auditRangeCondition}"
-    );
-
-    $patientCreationCount = (int) ($patientCreationRow['total'] ?? 0);
-
-    if ($scopeKey === 'meaningful') {
-        $discreteActivityRow = sqlQuery(
+        $patientSessionsRow = sqlQuery(
             "SELECT COUNT(
                 DISTINCT CONCAT_WS(
                     '|',
                     audit.user,
-                    audit.event,
-                    audit.category,
                     audit.patient_id,
-                    FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
+                    FLOOR(UNIX_TIMESTAMP(audit.date) / 1800)
                 )
              ) AS total
              FROM log AS audit
              INNER JOIN mod_maple_grove_education_users AS education_users
                  ON education_users.username = audit.user
              WHERE education_users.track_activity = 1
-               AND {$meaningfulNonCreationCondition}
+               AND {$patientChartCondition}
                AND {$auditRangeCondition}"
         );
 
-        $auditEventsCount =
-            (int) ($discreteActivityRow['total'] ?? 0)
-            + $patientCreationCount
-            + $patientChartSessions;
-    }
+        $patientChartSessions = (int) ($patientSessionsRow['total'] ?? 0);
 
-    $clinicalChangesRow = sqlQuery(
-        "SELECT COUNT(
-            DISTINCT CONCAT_WS(
-                '|',
-                audit.user,
-                audit.event,
-                audit.category,
-                audit.patient_id,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
-            )
-         ) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND audit.success = 1
-           AND audit.event IN (
-               'patient-record-insert',
-               'patient-record-update',
-               'patient-record-delete',
-               'patient-record-replace'
-           )
-           AND NOT ({$patientCreationBundleCondition})
-           AND audit.patient_id > 0
-           AND {$auditRangeCondition}"
-    );
-
-    $clinicalChangeCount =
-        (int) ($clinicalChangesRow['total'] ?? 0)
-        + $patientCreationCount;
-
-    $schedulingChangesRow = sqlQuery(
-        "SELECT COUNT(*) AS total
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND audit.success = 1
-           AND audit.event IN (
-               'scheduling-insert',
-               'scheduling-update',
-               'scheduling-delete'
-           )
-           AND {$auditRangeCondition}"
-    );
-
-    $schedulingChangeCount = (int) (
-        $schedulingChangesRow['total']
-        ?? 0
-    );
-
-    $moduleEventsRow = sqlQuery(
-        "SELECT COUNT(*) AS total
-         FROM mod_maple_grove_education_events AS events
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.openemr_user_id = events.openemr_user_id
-         WHERE education_users.track_activity = 1
-           AND {$moduleRangeCondition}"
-    );
-
-    $moduleEventsCount = (int) ($moduleEventsRow['total'] ?? 0);
-
-    $lastCohortAudit = sqlQuery(
-        "SELECT
-            audit.user,
-            audit.event,
-            audit.category,
-            audit.patient_id,
-            audit.date
-         FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         WHERE education_users.track_activity = 1
-           AND {$effectiveAuditCondition}
-         ORDER BY audit.date DESC, audit.id DESC
-         LIMIT 1"
-    );
-
-    if ($scopeKey === 'meaningful') {
-        $discreteActivityStatement = sqlStatement(
-            "SELECT
-                audit.user,
-                audit.event,
-                audit.category,
-                audit.patient_id,
-                MIN(audit.date) AS session_start,
-                MAX(audit.date) AS date,
-                COUNT(*) AS repeated_count
-             FROM log AS audit
-             INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
-             WHERE education_users.track_activity = 1
-               AND {$meaningfulNonCreationCondition}
-               AND {$auditRangeCondition}
-             GROUP BY
-                audit.user,
-                audit.event,
-                audit.category,
-                audit.patient_id,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
-             ORDER BY date DESC
-             LIMIT 60"
-        );
-
-        while ($row = sqlFetchArray($discreteActivityStatement)) {
-            $recentCohortAudit[] = $row;
+        if ($scopeKey === 'meaningful') {
+            $auditEventsCount =
+                (int) ($summaryRow['discrete_activities'] ?? 0)
+                + $patientCreationCount
+                + $patientChartSessions;
+        } else {
+            $auditEventsCount = (int) ($summaryRow['raw_rows'] ?? 0);
         }
 
-        $patientCreationStatement = sqlStatement(
-            "SELECT
-                audit.user,
-                'patient-record-insert' AS event,
-                'Patient Record' AS category,
-                MAX(audit.patient_id) AS patient_id,
-                MIN(audit.date) AS session_start,
-                MAX(audit.date) AS date,
-                COUNT(*) AS repeated_count
-             FROM log AS audit
+        $moduleEventsRow = sqlQuery(
+            "SELECT COUNT(*) AS total
+             FROM mod_maple_grove_education_events AS events
              INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
+                 ON education_users.openemr_user_id = events.openemr_user_id
              WHERE education_users.track_activity = 1
-               AND {$patientCreationBundleCondition}
-               AND {$auditRangeCondition}
-             GROUP BY
-                audit.user,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 10)
-             ORDER BY date DESC
-             LIMIT 60"
+               AND {$moduleRangeCondition}"
         );
 
-        while ($row = sqlFetchArray($patientCreationStatement)) {
-            $recentCohortAudit[] = $row;
-        }
+        $moduleEventsCount = (int) ($moduleEventsRow['total'] ?? 0);
 
-        $chartSessionStatement = sqlStatement(
-            "SELECT
-                audit.user,
-                'patient-chart-session' AS event,
-                'Patient Chart' AS category,
-                audit.patient_id,
-                MIN(audit.date) AS session_start,
-                MAX(audit.date) AS date,
-                COUNT(*) AS repeated_count
-             FROM log AS audit
-             INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
-             WHERE education_users.track_activity = 1
-               AND {$meaningfulPatientChartCondition}
-               AND {$auditRangeCondition}
-             GROUP BY
-                audit.user,
-                audit.patient_id,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 1800)
-             ORDER BY date DESC
-             LIMIT 60"
-        );
+        /*
+         * Build a fair recent feed. Each tracked student contributes at most
+         * three normalized activities, preventing one very active account from
+         * filling the entire cohort table. Each per-user lookup is bounded and
+         * uses the user/date index instead of globally grouping the full range.
+         */
+        $recentPerStudent = 3;
+        $candidateRowsPerStudent = 250;
+        $candidateCondition = $scopeKey === 'all'
+            ? 'audit.success = 1'
+            : EducationAnalytics::meaningfulAuditCondition('audit');
 
-        while ($row = sqlFetchArray($chartSessionStatement)) {
-            $recentCohortAudit[] = $row;
+        foreach ($trackedStudents as $trackedUsername) {
+            $candidateRows = [];
+            $candidateStatement = sqlStatement(
+                "SELECT
+                    audit.user,
+                    audit.event,
+                    audit.category,
+                    audit.patient_id,
+                    audit.date,
+                    audit.id
+                 FROM log AS audit
+                 WHERE audit.user = ?
+                   AND {$candidateCondition}
+                   AND {$auditRangeCondition}
+                 ORDER BY audit.date DESC, audit.id DESC
+                 LIMIT {$candidateRowsPerStudent}",
+                [$trackedUsername]
+            );
+
+            while ($row = sqlFetchArray($candidateStatement)) {
+                $candidateRows[] = $row;
+            }
+
+            $normalizedRows = normalizeRecentAuditRows(
+                $candidateRows,
+                $scopeKey
+            );
+
+            foreach (
+                array_slice($normalizedRows, 0, $recentPerStudent)
+                as $activity
+            ) {
+                $recentCohortAudit[] = $activity;
+            }
         }
 
         usort(
@@ -429,93 +540,49 @@ if ($canManageEducation) {
             $lastCohortAudit = $recentCohortAudit[0];
         }
 
-        if ($patientChartSessions > 0) {
-            $auditBreakdown[] = [
-                'event' => 'patient-chart-session',
-                'category' => 'Patient Chart',
-                'total' => $patientChartSessions
-            ];
+        /*
+         * The side breakdown now reflects the displayed recent feed. This
+         * avoids another expensive full-range GROUP BY while still showing the
+         * mix of activity represented in the table beside it.
+         */
+        $breakdownCounts = [];
+
+        foreach ($recentCohortAudit as $activity) {
+            $key = ($activity['event'] ?? '') . '|' . ($activity['category'] ?? '');
+
+            if (!isset($breakdownCounts[$key])) {
+                $breakdownCounts[$key] = [
+                    'event' => (string) ($activity['event'] ?? ''),
+                    'category' => (string) ($activity['category'] ?? ''),
+                    'total' => 0
+                ];
+            }
+
+            $breakdownCounts[$key]['total']++;
         }
 
-        if ($patientCreationCount > 0) {
-            $auditBreakdown[] = [
-                'event' => 'patient-record-insert',
-                'category' => 'Patient Record',
-                'total' => $patientCreationCount
-            ];
-        }
+        $auditBreakdown = array_values($breakdownCounts);
 
-        $auditBreakdownStatement = sqlStatement(
-            "SELECT
-                audit.event,
-                audit.category,
-                COUNT(
-                    DISTINCT CONCAT_WS(
-                        '|',
-                        audit.user,
-                        audit.patient_id,
-                        FLOOR(UNIX_TIMESTAMP(audit.date) / 60)
-                    )
-                ) AS total
-             FROM log AS audit
-             INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
-             WHERE education_users.track_activity = 1
-               AND {$meaningfulNonCreationCondition}
-               AND {$auditRangeCondition}
-             GROUP BY audit.event, audit.category
-             ORDER BY total DESC, audit.event, audit.category
-             LIMIT 14"
-        );
-    } else {
-        $recentAuditStatement = sqlStatement(
-            "SELECT
-                audit.user,
-                audit.event,
-                audit.category,
-                audit.patient_id,
-                MIN(audit.date) AS session_start,
-                MAX(audit.date) AS date,
-                COUNT(*) AS repeated_count
-             FROM log AS audit
-             INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
-             WHERE education_users.track_activity = 1
-               AND {$auditScopeCondition}
-               AND {$auditRangeCondition}
-             GROUP BY
-                audit.user,
-                audit.event,
-                audit.category,
-                audit.patient_id,
-                FLOOR(UNIX_TIMESTAMP(audit.date) / 300)
-             ORDER BY date DESC
-             LIMIT 30"
+        usort(
+            $auditBreakdown,
+            static function (array $left, array $right): int {
+                return ((int) $right['total']) <=> ((int) $left['total']);
+            }
         );
 
-        while ($row = sqlFetchArray($recentAuditStatement)) {
-            $recentCohortAudit[] = $row;
-        }
-
-        $auditBreakdownStatement = sqlStatement(
-            "SELECT
-                audit.event,
-                audit.category,
-                COUNT(*) AS total
-             FROM log AS audit
-             INNER JOIN mod_maple_grove_education_users AS education_users
-                 ON education_users.username = audit.user
-             WHERE education_users.track_activity = 1
-               AND {$auditScopeCondition}
-               AND {$auditRangeCondition}
-             GROUP BY audit.event, audit.category
-             ORDER BY total DESC, audit.event, audit.category
-             LIMIT 15"
-        );
-    }
-
-    while ($row = sqlFetchArray($auditBreakdownStatement)) {
-        $auditBreakdown[] = $row;
+        $_SESSION['maple_grove_education_analytics_cache'][$cacheKey] = [
+            'cached_at' => time(),
+            'activeStudentCount' => $activeStudentCount,
+            'auditEventsCount' => $auditEventsCount,
+            'loginCount' => $loginCount,
+            'patientChartSessions' => $patientChartSessions,
+            'clinicalChangeCount' => $clinicalChangeCount,
+            'schedulingChangeCount' => $schedulingChangeCount,
+            'moduleEventsCount' => $moduleEventsCount,
+            'lastCohortAudit' => $lastCohortAudit,
+            'recentCohortAudit' => $recentCohortAudit,
+            'auditBreakdown' => $auditBreakdown
+        ];
     }
 }
 
@@ -829,9 +896,42 @@ function renderAuditTime(array $event): string
     </title>
 
     <?php Header::setupHeader(); ?>
+
+    <style>
+        #dashboard-loading-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 2000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.82);
+        }
+
+        #dashboard-loading-overlay.is-visible {
+            display: flex;
+        }
+
+        .dashboard-loading-card {
+            min-width: 230px;
+            padding: 1.25rem 1.5rem;
+            text-align: center;
+            background: #fff;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+            border-radius: 0.4rem;
+            box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.12);
+        }
+    </style>
 </head>
 
 <body class="body_top">
+<div id="dashboard-loading-overlay" aria-live="polite" aria-busy="true">
+    <div class="dashboard-loading-card">
+        <div class="spinner-border text-primary mb-3" role="status" aria-hidden="true"></div>
+        <div><strong><?php echo xlt('Loading dashboard…'); ?></strong></div>
+        <div class="small text-muted mt-1"><?php echo xlt('Processing OpenEMR activity.'); ?></div>
+    </div>
+</div>
 <div class="container-fluid mt-3 mb-4">
 
     <div class="d-flex flex-wrap justify-content-between align-items-start mb-3">
@@ -849,7 +949,7 @@ function renderAuditTime(array $event): string
             <?php if ($canManageEducation) : ?>
                 <a
                     class="btn btn-outline-primary mr-2"
-                    href="manage-education-users.php"
+                    href="manage-education-users.php?return_range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;return_scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
                 >
                     <?php echo xlt('Manage Education Users'); ?>
                 </a>
@@ -861,7 +961,7 @@ function renderAuditTime(array $event): string
         </div>
     </div>
 
-    <form method="get" class="form-inline mb-3">
+    <form method="get" class="form-inline mb-3" id="analytics-filter-form">
         <label for="range" class="mr-2">
             <strong><?php echo xlt('Date Range'); ?></strong>
         </label>
@@ -870,7 +970,7 @@ function renderAuditTime(array $event): string
             class="form-control mr-3"
             id="range"
             name="range"
-            onchange="this.form.submit()"
+            onchange="showDashboardLoading(); this.form.submit()"
         >
             <?php foreach ($rangeOptions as $key => $option) : ?>
                 <option
@@ -890,7 +990,7 @@ function renderAuditTime(array $event): string
             class="form-control mr-2"
             id="scope"
             name="scope"
-            onchange="this.form.submit()"
+            onchange="showDashboardLoading(); this.form.submit()"
         >
             <?php foreach ($scopeOptions as $key => $label) : ?>
                 <option
@@ -908,6 +1008,13 @@ function renderAuditTime(array $event): string
             </button>
         </noscript>
     </form>
+
+    <?php if ($canManageEducation) : ?>
+        <p class="small text-muted mt-n2 mb-3">
+            Dashboard results are reused for up to 60 seconds to make returning
+            to this page faster.
+        </p>
+    <?php endif; ?>
 
     <?php if ($scopeKey === 'all') : ?>
         <div class="alert alert-warning">
@@ -1166,7 +1273,7 @@ function renderAuditTime(array $event): string
             <div class="col-xl-4 mb-3">
                 <div class="card shadow-sm h-100">
                     <div class="card-header">
-                        <strong><?php echo xlt($scopeKey === 'meaningful' ? 'Activity Breakdown' : 'Audit Breakdown'); ?></strong>
+                        <strong><?php echo xlt($scopeKey === 'meaningful' ? 'Recent Activity Mix' : 'Recent Audit Mix'); ?></strong>
                     </div>
 
                     <?php if (empty($auditBreakdown)) : ?>
@@ -1398,6 +1505,14 @@ function renderAuditTime(array $event): string
 </div>
 
 <script>
+function showDashboardLoading() {
+    const overlay = document.getElementById("dashboard-loading-overlay");
+
+    if (overlay) {
+        overlay.classList.add("is-visible");
+    }
+}
+
 document.addEventListener("DOMContentLoaded", function () {
     const timestampRangePattern =
         /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\s+–\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}))?$/;

@@ -19,6 +19,22 @@ $currentUserId = EducationAnalytics::currentUserId();
 $currentUsername = EducationAnalytics::currentUsername();
 $canManageEducation = EducationAnalytics::canManageEducation($currentUserId);
 
+$returnRange = (string) ($_GET['return_range'] ?? '7');
+$returnScope = (string) ($_GET['return_scope'] ?? 'meaningful');
+
+if (!in_array($returnRange, ['today', '7', '30', 'all'], true)) {
+    $returnRange = '7';
+}
+
+if (!in_array($returnScope, ['meaningful', 'all'], true)) {
+    $returnScope = 'meaningful';
+}
+
+$dashboardReturnUrl = 'education-dashboard.php?range='
+    . rawurlencode($returnRange)
+    . '&scope='
+    . rawurlencode($returnScope);
+
 if (!$canManageEducation) {
     http_response_code(403);
 }
@@ -172,9 +188,42 @@ if ($canManageEducation) {
     </title>
 
     <?php Header::setupHeader(); ?>
+
+    <style>
+        #dashboard-loading-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 2000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.82);
+        }
+
+        #dashboard-loading-overlay.is-visible {
+            display: flex;
+        }
+
+        .dashboard-loading-card {
+            min-width: 230px;
+            padding: 1.25rem 1.5rem;
+            text-align: center;
+            background: #fff;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+            border-radius: 0.4rem;
+            box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.12);
+        }
+    </style>
 </head>
 
 <body class="body_top">
+<div id="dashboard-loading-overlay" aria-live="polite" aria-busy="true">
+    <div class="dashboard-loading-card">
+        <div class="spinner-border text-primary mb-3" role="status" aria-hidden="true"></div>
+        <div><strong><?php echo xlt('Loading dashboard…'); ?></strong></div>
+        <div class="small text-muted mt-1"><?php echo xlt('Processing OpenEMR activity.'); ?></div>
+    </div>
+</div>
 <div class="container-fluid mt-3 mb-4">
 
     <?php if (!$canManageEducation) : ?>
@@ -206,7 +255,8 @@ if ($canManageEducation) {
 
             <a
                 class="btn btn-outline-secondary mt-2 mt-md-0"
-                href="education-dashboard.php"
+                href="<?php echo attr($dashboardReturnUrl); ?>"
+                onclick="showDashboardLoading()"
             >
                 <?php echo xlt('Back to Dashboard'); ?>
             </a>
@@ -329,5 +379,15 @@ if ($canManageEducation) {
     <?php endif; ?>
 
 </div>
+<script>
+function showDashboardLoading() {
+    const overlay = document.getElementById("dashboard-loading-overlay");
+
+    if (overlay) {
+        overlay.classList.add("is-visible");
+    }
+}
+</script>
+
 </body>
 </html>
