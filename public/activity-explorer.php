@@ -157,7 +157,7 @@ $trackedStudentStatement = sqlStatement(
      LEFT JOIN users
         ON users.id = education_users.openemr_user_id
      WHERE education_users.track_activity = 1
-     ORDER BY users.lname, users.fname, education_users.username"
+     ORDER BY users.fname, users.lname, education_users.username"
 );
 
 while ($row = sqlFetchArray($trackedStudentStatement)) {
@@ -1305,6 +1305,7 @@ $pageNumber = count($trail) + 1;
                                         <div
                                             class="custom-control custom-checkbox student-filter-option"
                                             data-student-search="<?php echo attr($searchText); ?>"
+                                            data-student-sort-key="<?php echo attr(strtolower($fullName !== '' ? $fullName : $username)); ?>"
                                         >
                                             <input
                                                 class="custom-control-input student-filter-checkbox"
@@ -1603,6 +1604,35 @@ document.addEventListener("DOMContentLoaded", function () {
     const studentFilterButton = document.getElementById("student-filter-button");
     const studentMatchCount = document.getElementById("student-filter-match-count");
     const clearStudentSelection = document.getElementById("clear-student-selection");
+    const studentOptionsContainer = document.getElementById("student-filter-options");
+
+    const sortStudentOptions = function () {
+        if (!studentOptionsContainer) {
+            return;
+        }
+
+        studentOptions.sort(function (left, right) {
+            const leftCheckbox = left.querySelector(".student-filter-checkbox");
+            const rightCheckbox = right.querySelector(".student-filter-checkbox");
+            const leftSelected = leftCheckbox && leftCheckbox.checked;
+            const rightSelected = rightCheckbox && rightCheckbox.checked;
+
+            if (leftSelected !== rightSelected) {
+                return leftSelected ? -1 : 1;
+            }
+
+            const leftKey = left.dataset.studentSortKey || "";
+            const rightKey = right.dataset.studentSortKey || "";
+
+            return leftKey.localeCompare(rightKey, undefined, {
+                sensitivity: "base"
+            });
+        });
+
+        studentOptions.forEach(function (option) {
+            studentOptionsContainer.appendChild(option);
+        });
+    };
 
     const updateStudentButton = function () {
         if (!studentFilterButton) {
@@ -1667,6 +1697,7 @@ document.addEventListener("DOMContentLoaded", function () {
             if (checkbox) {
                 checkbox.checked = true;
                 updateStudentButton();
+                sortStudentOptions();
                 studentSearch.value = "";
                 filterStudentOptions();
                 studentSearch.focus();
@@ -1675,7 +1706,11 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     studentCheckboxes.forEach(function (checkbox) {
-        checkbox.addEventListener("change", updateStudentButton);
+        checkbox.addEventListener("change", function () {
+            updateStudentButton();
+            sortStudentOptions();
+            filterStudentOptions();
+        });
     });
 
     if (clearStudentSelection) {
@@ -1684,10 +1719,13 @@ document.addEventListener("DOMContentLoaded", function () {
                 checkbox.checked = false;
             });
             updateStudentButton();
+            sortStudentOptions();
+            filterStudentOptions();
         });
     }
 
     updateStudentButton();
+    sortStudentOptions();
     filterStudentOptions();
 
     const timestampRangePattern =
