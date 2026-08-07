@@ -528,7 +528,11 @@ $myModuleEvents = 0;
 $myLastAudit = false;
 $myRecentAudit = [];
 
-if ($isTrackedStudent && $currentUsername !== '') {
+if (
+    !$canManageEducation &&
+    $isTrackedStudent &&
+    $currentUsername !== ''
+) {
     $myActiveDaysRow = sqlQuery(
         "SELECT COUNT(DISTINCT DATE(audit.date)) AS total
          FROM log AS audit
