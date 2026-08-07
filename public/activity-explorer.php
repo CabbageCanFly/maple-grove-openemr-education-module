@@ -146,19 +146,41 @@ if ($rangeKey === 'custom') {
 }
 
 $trackedStudents = [];
+$trackedStudentProfiles = [];
+$trackedStudentProfilesLower = [];
 $trackedStudentStatement = sqlStatement(
-    "SELECT username
-     FROM mod_maple_grove_education_users
-     WHERE track_activity = 1
-     ORDER BY username"
+    "SELECT
+        education_users.username,
+        users.fname,
+        users.lname
+     FROM mod_maple_grove_education_users AS education_users
+     LEFT JOIN users
+        ON users.id = education_users.openemr_user_id
+     WHERE education_users.track_activity = 1
+     ORDER BY users.lname, users.fname, education_users.username"
 );
 
 while ($row = sqlFetchArray($trackedStudentStatement)) {
     $username = trim((string) ($row['username'] ?? ''));
 
-    if ($username !== '') {
-        $trackedStudents[] = $username;
+    if ($username === '') {
+        continue;
     }
+
+    $fullName = trim(
+        trim((string) ($row['fname'] ?? ''))
+        . ' '
+        . trim((string) ($row['lname'] ?? ''))
+    );
+
+    $trackedStudents[] = $username;
+    $trackedStudentProfiles[$username] = [
+        'full_name' => $fullName
+    ];
+    $trackedStudentProfilesLower[strtolower($username)] = [
+        'username' => $username,
+        'full_name' => $fullName
+    ];
 }
 
 $selectedStudents = [];
@@ -249,6 +271,50 @@ function explorerActivityCondition(array $activityTypes, string $scopeKey): stri
         static fn(string $condition): string => '(' . $condition . ')',
         $conditions
     )) . ')';
+}
+
+function explorerMeaningfulDiscreteCondition(array $activityTypes): string
+{
+    if (empty($activityTypes)) {
+        return EducationAnalytics::meaningfulDiscreteAuditCondition('audit');
+    }
+
+    $conditions = [];
+
+    foreach ($activityTypes as $activityType) {
+        if ($activityType === 'auth') {
+            $conditions[] = "audit.success = 1 AND audit.event IN ('login', 'logout')";
+        } elseif ($activityType === 'clinical') {
+            $conditions[] = "audit.success = 1 AND audit.event IN (
+                'patient-record-insert',
+                'patient-record-update',
+                'patient-record-delete',
+                'patient-record-replace'
+            )";
+        } elseif ($activityType === 'scheduling') {
+            $conditions[] = "audit.success = 1 AND audit.event IN (
+                'scheduling-insert',
+                'scheduling-update',
+                'scheduling-delete'
+            )";
+        } elseif ($activityType === 'sign_print') {
+            $conditions[] = "audit.success = 1 AND audit.event IN ('esign', 'print')";
+        }
+    }
+
+    if (empty($conditions)) {
+        return '1 = 0';
+    }
+
+    return '(' . implode(' OR ', array_map(
+        static fn(string $condition): string => '(' . $condition . ')',
+        $conditions
+    )) . ')';
+}
+
+function explorerIncludesPatientSessions(array $activityTypes): bool
+{
+    return empty($activityTypes) || in_array('patient', $activityTypes, true);
 }
 
 function normalizeExplorerRows(array $rows, string $scopeKey): array
@@ -505,6 +571,29 @@ function normalizeExplorerRows(array $rows, string $scopeKey): array
     return $activities;
 }
 
+function renderExplorerUser(
+    string $username,
+    array $profiles,
+    array $profilesLower
+): string {
+    $profile = $profiles[$username] ?? null;
+
+    if ($profile === null) {
+        $profile = $profilesLower[strtolower($username)] ?? null;
+    }
+
+    $fullName = trim((string) ($profile['full_name'] ?? ''));
+    $html = '<code>' . text($username) . '</code>';
+
+    if ($fullName !== '') {
+        $html .= '<small class="text-muted d-block">'
+            . text($fullName)
+            . '</small>';
+    }
+
+    return $html;
+}
+
 function renderExplorerPatient(
     array $activity,
     bool $canViewPatientDemographics
@@ -686,15 +775,19 @@ function hydrateExplorerPatients(array &$activities, bool $canViewDemographics):
 
 $activityCondition = explorerActivityCondition($selectedActivityTypes, $scopeKey);
 $patientFilterIds = explorerPatientMatches($patientSearch, $canViewPatientDemographics);
-$candidateLimit = in_array('patient', $selectedActivityTypes, true) ? 1500 : 1000;
-$maxChunks = 16;
-$queryCursor = $beforeId;
-$rawRows = [];
-$lastFetchCount = 0;
-$chunksUsed = 0;
 $scanLimitReached = false;
+$activities = [];
+$hasMore = false;
 
-for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
+$buildBaseConditions = static function (
+    array $effectiveStudents,
+    string $rangeCondition,
+    array $rangeParams,
+    int $cursor,
+    string $extraCondition,
+    string $patientSearch,
+    array $patientFilterIds
+): array {
     $conditions = [];
     $params = [];
 
@@ -706,13 +799,13 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
         array_push($params, ...$effectiveStudents);
     }
 
-    $conditions[] = $activityCondition;
-    $conditions[] = $auditRangeCondition;
-    array_push($params, ...$auditRangeParams);
+    $conditions[] = $extraCondition;
+    $conditions[] = $rangeCondition;
+    array_push($params, ...$rangeParams);
 
-    if ($queryCursor > 0) {
+    if ($cursor > 0) {
         $conditions[] = 'audit.id < ?';
-        $params[] = $queryCursor;
+        $params[] = $cursor;
     }
 
     if ($patientSearch !== '') {
@@ -721,7 +814,22 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
         array_push($params, ...$patientFilterIds);
     }
 
+    return [$conditions, $params];
+};
+
+if ($scopeKey === 'all') {
+    [$conditions, $params] = $buildBaseConditions(
+        $effectiveStudents,
+        $auditRangeCondition,
+        $auditRangeParams,
+        $beforeId,
+        $activityCondition,
+        $patientSearch,
+        $patientFilterIds
+    );
+
     $whereSql = implode("\n AND ", $conditions);
+    $rawLimit = $pageSize + 1;
     $statement = sqlStatement(
         "SELECT
             audit.id,
@@ -733,55 +841,245 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
          FROM log AS audit
          WHERE {$whereSql}
          ORDER BY audit.id DESC
-         LIMIT {$candidateLimit}",
+         LIMIT {$rawLimit}",
         $params
     );
 
-    $chunkRows = [];
+    $rawRows = [];
     while ($row = sqlFetchArray($statement)) {
-        $chunkRows[] = $row;
+        $rawRows[] = $row;
     }
 
-    $lastFetchCount = count($chunkRows);
-    $chunksUsed++;
+    $activities = normalizeExplorerRows($rawRows, 'all');
+    $hasMore = count($activities) > $pageSize;
+} else {
+    $discreteActivities = [];
+    $discreteCondition = explorerMeaningfulDiscreteCondition($selectedActivityTypes);
 
-    if ($lastFetchCount === 0) {
-        break;
+    if ($discreteCondition !== '1 = 0') {
+        $candidateLimit = max(300, $pageSize * 4);
+        $maxChunks = 20;
+        $queryCursor = $beforeId;
+        $rawDiscreteRows = [];
+        $lastFetchCount = 0;
+
+        for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
+            [$conditions, $params] = $buildBaseConditions(
+                $effectiveStudents,
+                $auditRangeCondition,
+                $auditRangeParams,
+                $queryCursor,
+                $discreteCondition,
+                $patientSearch,
+                $patientFilterIds
+            );
+
+            $whereSql = implode("\n AND ", $conditions);
+            $statement = sqlStatement(
+                "SELECT
+                    audit.id,
+                    audit.user,
+                    audit.event,
+                    audit.category,
+                    audit.patient_id,
+                    audit.date
+                 FROM log AS audit
+                 WHERE {$whereSql}
+                 ORDER BY audit.id DESC
+                 LIMIT {$candidateLimit}",
+                $params
+            );
+
+            $chunkRows = [];
+            while ($row = sqlFetchArray($statement)) {
+                $chunkRows[] = $row;
+            }
+
+            $lastFetchCount = count($chunkRows);
+
+            if ($lastFetchCount === 0) {
+                break;
+            }
+
+            array_push($rawDiscreteRows, ...$chunkRows);
+            $lastRow = end($chunkRows);
+            $queryCursor = (int) ($lastRow['id'] ?? 0);
+            $discreteActivities = normalizeExplorerRows(
+                $rawDiscreteRows,
+                'meaningful'
+            );
+
+            if (count($discreteActivities) >= ($pageSize + 1)) {
+                break;
+            }
+
+            if ($lastFetchCount < $candidateLimit || $queryCursor <= 0) {
+                break;
+            }
+
+            if ($chunk === ($maxChunks - 1)) {
+                $scanLimitReached = true;
+            }
+        }
     }
 
-    array_push($rawRows, ...$chunkRows);
-    $lastRow = end($chunkRows);
-    $queryCursor = (int) ($lastRow['id'] ?? 0);
+    $patientActivities = [];
 
-    $previewActivities = normalizeExplorerRows($rawRows, $scopeKey);
+    if (explorerIncludesPatientSessions($selectedActivityTypes)) {
+        [$patientConditions, $patientParams] = $buildBaseConditions(
+            $effectiveStudents,
+            $auditRangeCondition,
+            $auditRangeParams,
+            0,
+            EducationAnalytics::patientChartAuditCondition('audit'),
+            $patientSearch,
+            $patientFilterIds
+        );
 
-    // Keep scanning the already-filtered audit stream until the requested
-    // page is actually full after deduplication/sessionization.
-    if (count($previewActivities) >= ($pageSize + 1)) {
-        break;
+        $patientWhereSql = implode("\n AND ", $patientConditions);
+        $sessionCursorCondition = '';
+
+        if ($beforeId > 0) {
+            $sessionCursorCondition = 'AND sessions.last_log_id < ?';
+            $patientParams[] = $beforeId;
+        }
+
+        $sessionLimit = $pageSize + 1;
+        $patientStatement = sqlStatement(
+            "WITH patient_reads AS (
+                SELECT
+                    audit.id,
+                    audit.user,
+                    audit.patient_id,
+                    audit.date,
+                    LAG(audit.date) OVER (
+                        PARTITION BY audit.user, audit.patient_id
+                        ORDER BY audit.date ASC, audit.id ASC
+                    ) AS previous_date
+                FROM log AS audit
+                WHERE {$patientWhereSql}
+            ),
+            session_marks AS (
+                SELECT
+                    id,
+                    user,
+                    patient_id,
+                    date,
+                    CASE
+                        WHEN previous_date IS NULL
+                          OR TIMESTAMPDIFF(SECOND, previous_date, date) > 1800
+                        THEN 1
+                        ELSE 0
+                    END AS new_session
+                FROM patient_reads
+            ),
+            sessionized AS (
+                SELECT
+                    id,
+                    user,
+                    patient_id,
+                    date,
+                    SUM(new_session) OVER (
+                        PARTITION BY user, patient_id
+                        ORDER BY date ASC, id ASC
+                        ROWS UNBOUNDED PRECEDING
+                    ) AS session_number
+                FROM session_marks
+            ),
+            patient_sessions AS (
+                SELECT
+                    user,
+                    patient_id,
+                    MIN(date) AS session_start,
+                    MAX(date) AS date,
+                    COUNT(*) AS repeated_count,
+                    MIN(id) AS first_log_id,
+                    MAX(id) AS last_log_id
+                FROM sessionized
+                GROUP BY user, patient_id, session_number
+            )
+            SELECT
+                sessions.user,
+                'patient-chart-session' AS event,
+                'Patient Chart' AS category,
+                sessions.patient_id,
+                sessions.session_start,
+                sessions.date,
+                sessions.repeated_count,
+                sessions.first_log_id,
+                sessions.last_log_id
+            FROM patient_sessions AS sessions
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM log AS created
+                WHERE created.user = sessions.user
+                  AND created.patient_id = sessions.patient_id
+                  AND created.success = 1
+                  AND created.event = 'patient-record-insert'
+                  AND created.category IN (
+                      'Patient Demographics',
+                      'Patient Insurance',
+                      'Social and Family History'
+                  )
+                  AND created.date BETWEEN
+                      DATE_SUB(sessions.session_start, INTERVAL 60 SECOND)
+                      AND DATE_ADD(sessions.date, INTERVAL 60 SECOND)
+            )
+            {$sessionCursorCondition}
+            ORDER BY sessions.date DESC, sessions.last_log_id DESC
+            LIMIT {$sessionLimit}",
+            $patientParams
+        );
+
+        while ($row = sqlFetchArray($patientStatement)) {
+            $patientActivities[] = [
+                'user' => (string) ($row['user'] ?? ''),
+                'event' => 'patient-chart-session',
+                'category' => 'Patient Chart',
+                'patient_id' => (int) ($row['patient_id'] ?? 0),
+                'session_start' => (string) ($row['session_start'] ?? ''),
+                'date' => (string) ($row['date'] ?? ''),
+                'repeated_count' => (int) ($row['repeated_count'] ?? 0),
+                'first_log_id' => (int) ($row['first_log_id'] ?? 0),
+                'last_log_id' => (int) ($row['last_log_id'] ?? 0),
+                'patient_name' => '',
+                'pubpid' => ''
+            ];
+        }
     }
 
-    if ($lastFetchCount < $candidateLimit || $queryCursor <= 0) {
-        break;
-    }
+    $activities = array_merge($discreteActivities, $patientActivities);
+    usort(
+        $activities,
+        static function (array $left, array $right): int {
+            $dateCompare = strcmp((string) $right['date'], (string) $left['date']);
 
-    if ($chunk === ($maxChunks - 1)) {
-        $scanLimitReached = true;
-    }
+            if ($dateCompare !== 0) {
+                return $dateCompare;
+            }
+
+            return ((int) $right['last_log_id']) <=> ((int) $left['last_log_id']);
+        }
+    );
+
+    $hasMore = count($activities) > $pageSize
+        || count($discreteActivities) > $pageSize
+        || count($patientActivities) > $pageSize
+        || $scanLimitReached;
 }
 
-$activities = normalizeExplorerRows($rawRows, $scopeKey);
 $displayActivities = array_slice($activities, 0, $pageSize);
 hydrateExplorerPatients($displayActivities, $canViewPatientDemographics);
-
-$hasMore = count($activities) > $pageSize
-    || $lastFetchCount === $candidateLimit
-    || $scanLimitReached;
 
 $nextBeforeId = 0;
 if (!empty($displayActivities)) {
     $lastDisplayed = end($displayActivities);
-    $nextBeforeId = (int) ($lastDisplayed['first_log_id'] ?? 0);
+
+    if (($lastDisplayed['event'] ?? '') === 'patient-chart-session') {
+        $nextBeforeId = (int) ($lastDisplayed['last_log_id'] ?? 0);
+    } else {
+        $nextBeforeId = (int) ($lastDisplayed['first_log_id'] ?? 0);
+    }
 }
 
 $currentCursorForTrail = $beforeId > 0 ? $beforeId : 0;
@@ -847,6 +1145,18 @@ $pageNumber = count($trail) + 1;
 
         .filter-checkbox-menu .custom-control {
             margin-bottom: 0.35rem;
+        }
+
+        #student-filter-menu {
+            min-width: 330px;
+            max-height: none;
+            overflow: visible;
+        }
+
+        #student-filter-options {
+            max-height: 245px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
         }
 
         .custom-date-fields {
@@ -980,6 +1290,7 @@ $pageNumber = count($trail) + 1;
                         <div class="dropdown mr-2 mb-2">
                             <button
                                 class="btn btn-outline-secondary dropdown-toggle"
+                                id="student-filter-button"
                                 type="button"
                                 data-toggle="dropdown"
                                 aria-haspopup="true"
@@ -993,26 +1304,60 @@ $pageNumber = count($trail) + 1;
                                 );
                                 ?>
                             </button>
-                            <div class="dropdown-menu p-3 filter-checkbox-menu">
+                            <div class="dropdown-menu p-3 filter-checkbox-menu" id="student-filter-menu">
                                 <div class="small text-muted mb-2">
-                                    Leave all unchecked to include every tracked student.
+                                    Search by username or full name. Leave all unchecked for every tracked student.
                                 </div>
-                                <?php foreach ($trackedStudents as $username) : ?>
-                                    <?php $checkboxId = 'student-' . md5($username); ?>
-                                    <div class="custom-control custom-checkbox">
-                                        <input
-                                            class="custom-control-input"
-                                            type="checkbox"
-                                            id="<?php echo attr($checkboxId); ?>"
-                                            name="students[]"
-                                            value="<?php echo attr($username); ?>"
-                                            <?php echo in_array($username, $selectedStudents, true) ? 'checked' : ''; ?>
+                                <input
+                                    class="form-control form-control-sm mb-2"
+                                    type="search"
+                                    id="student-filter-search"
+                                    placeholder="Search students…"
+                                    autocomplete="off"
+                                >
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <button
+                                        class="btn btn-sm btn-link p-0"
+                                        type="button"
+                                        id="clear-student-selection"
+                                    >
+                                        <?php echo xlt('Clear selected'); ?>
+                                    </button>
+                                    <span class="small text-muted" id="student-filter-match-count"></span>
+                                </div>
+                                <div id="student-filter-options">
+                                    <?php foreach ($trackedStudents as $username) : ?>
+                                        <?php
+                                        $checkboxId = 'student-' . md5($username);
+                                        $fullName = trim((string) (
+                                            $trackedStudentProfiles[$username]['full_name']
+                                            ?? ''
+                                        ));
+                                        $searchText = strtolower(trim($username . ' ' . $fullName));
+                                        ?>
+                                        <div
+                                            class="custom-control custom-checkbox student-filter-option"
+                                            data-student-search="<?php echo attr($searchText); ?>"
                                         >
-                                        <label class="custom-control-label" for="<?php echo attr($checkboxId); ?>">
-                                            <?php echo text($username); ?>
-                                        </label>
-                                    </div>
-                                <?php endforeach; ?>
+                                            <input
+                                                class="custom-control-input student-filter-checkbox"
+                                                type="checkbox"
+                                                id="<?php echo attr($checkboxId); ?>"
+                                                name="students[]"
+                                                value="<?php echo attr($username); ?>"
+                                                <?php echo in_array($username, $selectedStudents, true) ? 'checked' : ''; ?>
+                                            >
+                                            <label class="custom-control-label" for="<?php echo attr($checkboxId); ?>">
+                                                <code><?php echo text($username); ?></code>
+                                                <?php if ($fullName !== '') : ?>
+                                                    <small class="text-muted d-block">
+                                                        <?php echo text($fullName); ?>
+                                                    </small>
+                                                <?php endif; ?>
+                                            </label>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
                             </div>
                         </div>
                     <?php endif; ?>
@@ -1084,7 +1429,7 @@ $pageNumber = count($trail) + 1;
 
     <?php if ($scopeKey === 'meaningful') : ?>
         <div class="alert alert-info py-2">
-            Patient Chart Sessions are approximate activity periods: repeated reads of the same patient's chart are collapsed when they occur within 30 minutes of each other.
+            A Patient Chart Session groups OpenEMR patient-record-select / patient-access audit events for the same student and patient; reads less than 30 minutes apart count as one chart-viewing period.
         </div>
     <?php else : ?>
         <div class="alert alert-warning py-2">
@@ -1094,7 +1439,7 @@ $pageNumber = count($trail) + 1;
 
     <?php if ($scanLimitReached && count($displayActivities) < $pageSize) : ?>
         <div class="alert alert-warning py-2">
-            The explorer reached its bounded audit scan limit before filling this page. Narrow the date, student, activity, or patient filters for a complete page.
+            The explorer reached a safety scan limit while de-duplicating non-chart audit events, so this page may contain fewer rows than requested.
         </div>
     <?php endif; ?>
 
@@ -1132,7 +1477,15 @@ $pageNumber = count($trail) + 1;
                     <?php foreach ($displayActivities as $activity) : ?>
                         <tr>
                             <?php if ($canManageEducation) : ?>
-                                <td><code><?php echo text($activity['user']); ?></code></td>
+                                <td>
+                                    <?php
+                                    echo renderExplorerUser(
+                                        (string) $activity['user'],
+                                        $trackedStudentProfiles,
+                                        $trackedStudentProfilesLower
+                                    );
+                                    ?>
+                                </td>
                             <?php endif; ?>
                             <td>
                                 <?php
@@ -1272,6 +1625,103 @@ document.addEventListener("DOMContentLoaded", function () {
             event.stopPropagation();
         });
     });
+
+    const studentSearch = document.getElementById("student-filter-search");
+    const studentOptions = Array.from(
+        document.querySelectorAll(".student-filter-option")
+    );
+    const studentCheckboxes = Array.from(
+        document.querySelectorAll(".student-filter-checkbox")
+    );
+    const studentFilterButton = document.getElementById("student-filter-button");
+    const studentMatchCount = document.getElementById("student-filter-match-count");
+    const clearStudentSelection = document.getElementById("clear-student-selection");
+
+    const updateStudentButton = function () {
+        if (!studentFilterButton) {
+            return;
+        }
+
+        const selectedCount = studentCheckboxes.filter(function (checkbox) {
+            return checkbox.checked;
+        }).length;
+
+        studentFilterButton.textContent = selectedCount === 0
+            ? "Students: All tracked"
+            : "Students: " + selectedCount + " selected";
+    };
+
+    const filterStudentOptions = function () {
+        if (!studentSearch) {
+            return;
+        }
+
+        const query = studentSearch.value.trim().toLowerCase();
+        let visibleCount = 0;
+
+        studentOptions.forEach(function (option) {
+            const haystack = (option.dataset.studentSearch || "").toLowerCase();
+            const visible = query === "" || haystack.includes(query);
+            option.classList.toggle("d-none", !visible);
+
+            if (visible) {
+                visibleCount++;
+            }
+        });
+
+        if (studentMatchCount) {
+            studentMatchCount.textContent = query === ""
+                ? ""
+                : visibleCount + (visibleCount === 1 ? " match" : " matches");
+        }
+    };
+
+    if (studentSearch) {
+        studentSearch.addEventListener("input", filterStudentOptions);
+        studentSearch.addEventListener("keydown", function (event) {
+            if (event.key !== "Enter") {
+                return;
+            }
+
+            event.preventDefault();
+
+            const firstVisible = studentOptions.find(function (option) {
+                return !option.classList.contains("d-none");
+            });
+
+            if (!firstVisible) {
+                return;
+            }
+
+            const checkbox = firstVisible.querySelector(
+                ".student-filter-checkbox"
+            );
+
+            if (checkbox) {
+                checkbox.checked = true;
+                updateStudentButton();
+                studentSearch.value = "";
+                filterStudentOptions();
+                studentSearch.focus();
+            }
+        });
+    }
+
+    studentCheckboxes.forEach(function (checkbox) {
+        checkbox.addEventListener("change", updateStudentButton);
+    });
+
+    if (clearStudentSelection) {
+        clearStudentSelection.addEventListener("click", function () {
+            studentCheckboxes.forEach(function (checkbox) {
+                checkbox.checked = false;
+            });
+            updateStudentButton();
+        });
+    }
+
+    updateStudentButton();
+    filterStudentOptions();
 
     const timestampRangePattern =
         /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\s+–\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}))?$/;
