@@ -30,22 +30,11 @@ if (!$canManageEducation && !$isTrackedStudent) {
 }
 
 $rangeOptions = [
-    'today' => [
-        'label' => 'Today',
-        'audit_condition' => 'audit.date >= CURDATE()'
-    ],
-    '7' => [
-        'label' => 'Last 7 Days',
-        'audit_condition' => 'audit.date >= DATE_SUB(NOW(), INTERVAL 7 DAY)'
-    ],
-    '30' => [
-        'label' => 'Last 30 Days',
-        'audit_condition' => 'audit.date >= DATE_SUB(NOW(), INTERVAL 30 DAY)'
-    ],
-    'all' => [
-        'label' => 'All Available History',
-        'audit_condition' => '1 = 1'
-    ]
+    'today' => 'Today',
+    '7' => 'Last 7 Days',
+    '30' => 'Last 30 Days',
+    'all' => 'All Available History',
+    'custom' => 'Custom Dates'
 ];
 
 $scopeOptions = [
@@ -54,7 +43,6 @@ $scopeOptions = [
 ];
 
 $activityTypeOptions = [
-    'all' => 'All Activity Types',
     'auth' => 'Logins / Logouts',
     'patient' => 'Patient Chart Sessions',
     'clinical' => 'Clinical Record Changes',
@@ -64,14 +52,51 @@ $activityTypeOptions = [
 
 $pageSizeOptions = [25, 50, 100];
 
+function explorerValidDate(string $value): bool
+{
+    if (!preg_match('/^\\d{4}-\\d{2}-\\d{2}$/', $value)) {
+        return false;
+    }
+
+    $date = DateTime::createFromFormat('!Y-m-d', $value);
+
+    return $date !== false && $date->format('Y-m-d') === $value;
+}
+
 $rangeKey = (string) ($_GET['range'] ?? '7');
 $scopeKey = (string) ($_GET['scope'] ?? 'meaningful');
-$activityTypeKey = (string) ($_GET['activity_type'] ?? 'all');
-$studentFilter = trim((string) ($_GET['student'] ?? ''));
 $patientSearch = trim((string) ($_GET['patient'] ?? ''));
 $pageSize = (int) ($_GET['page_size'] ?? 50);
 $beforeId = max(0, (int) ($_GET['before_id'] ?? 0));
 $trailRaw = trim((string) ($_GET['trail'] ?? ''));
+$customStartDate = trim((string) ($_GET['start_date'] ?? ''));
+$customEndDate = trim((string) ($_GET['end_date'] ?? ''));
+
+$selectedStudentsRaw = $_GET['students'] ?? [];
+if (!is_array($selectedStudentsRaw)) {
+    $selectedStudentsRaw = [$selectedStudentsRaw];
+}
+
+// Backward compatibility with the v5/v6 single-student URL.
+$legacyStudent = trim((string) ($_GET['student'] ?? ''));
+if (empty($selectedStudentsRaw) && $legacyStudent !== '') {
+    $selectedStudentsRaw = [$legacyStudent];
+}
+
+$selectedActivityTypesRaw = $_GET['activity_types'] ?? [];
+if (!is_array($selectedActivityTypesRaw)) {
+    $selectedActivityTypesRaw = [$selectedActivityTypesRaw];
+}
+
+// Backward compatibility with the v5/v6 single-activity URL.
+$legacyActivityType = trim((string) ($_GET['activity_type'] ?? ''));
+if (
+    empty($selectedActivityTypesRaw)
+    && $legacyActivityType !== ''
+    && $legacyActivityType !== 'all'
+) {
+    $selectedActivityTypesRaw = [$legacyActivityType];
+}
 
 if (!isset($rangeOptions[$rangeKey])) {
     $rangeKey = '7';
@@ -81,17 +106,44 @@ if (!isset($scopeOptions[$scopeKey])) {
     $scopeKey = 'meaningful';
 }
 
-if (!isset($activityTypeOptions[$activityTypeKey])) {
-    $activityTypeKey = 'all';
-}
-
 if (!in_array($pageSize, $pageSizeOptions, true)) {
     $pageSize = 50;
 }
 
 $patientSearch = substr($patientSearch, 0, 100);
-$auditRangeCondition = $rangeOptions[$rangeKey]['audit_condition'];
-$rangeLabel = $rangeOptions[$rangeKey]['label'];
+$dateRangeMessage = '';
+$auditRangeCondition = '';
+$auditRangeParams = [];
+$rangeLabel = $rangeOptions[$rangeKey];
+
+if ($rangeKey === 'custom') {
+    if (!explorerValidDate($customStartDate)) {
+        $customStartDate = date('Y-m-d', strtotime('-6 days'));
+        $dateRangeMessage = 'A valid start date was required; the last 7 days were used.';
+    }
+
+    if (!explorerValidDate($customEndDate)) {
+        $customEndDate = date('Y-m-d');
+        $dateRangeMessage = 'A valid end date was required; today was used.';
+    }
+
+    if ($customStartDate > $customEndDate) {
+        [$customStartDate, $customEndDate] = [$customEndDate, $customStartDate];
+        $dateRangeMessage = 'Start and end dates were reversed so the earlier date comes first.';
+    }
+
+    $auditRangeCondition = "audit.date >= ? AND audit.date < DATE_ADD(?, INTERVAL 1 DAY)";
+    $auditRangeParams = [$customStartDate, $customEndDate];
+    $rangeLabel = $customStartDate . ' – ' . $customEndDate;
+} elseif ($rangeKey === 'today') {
+    $auditRangeCondition = 'audit.date >= CURDATE()';
+} elseif ($rangeKey === '7') {
+    $auditRangeCondition = 'audit.date >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+} elseif ($rangeKey === '30') {
+    $auditRangeCondition = 'audit.date >= DATE_SUB(NOW(), INTERVAL 30 DAY)';
+} else {
+    $auditRangeCondition = '1 = 1';
+}
 
 $trackedStudents = [];
 $trackedStudentStatement = sqlStatement(
@@ -109,17 +161,40 @@ while ($row = sqlFetchArray($trackedStudentStatement)) {
     }
 }
 
+$selectedStudents = [];
+foreach ($selectedStudentsRaw as $username) {
+    $username = trim((string) $username);
+
+    if (
+        $username !== ''
+        && in_array($username, $trackedStudents, true)
+        && !in_array($username, $selectedStudents, true)
+    ) {
+        $selectedStudents[] = $username;
+    }
+}
+
 if (!$canManageEducation) {
-    $studentFilter = $currentUsername;
-} elseif (
-    $studentFilter !== ''
-    && !in_array($studentFilter, $trackedStudents, true)
-) {
-    $studentFilter = '';
+    $selectedStudents = [$currentUsername];
+}
+
+$effectiveStudents = $canManageEducation && empty($selectedStudents)
+    ? $trackedStudents
+    : $selectedStudents;
+
+$selectedActivityTypes = [];
+foreach ($selectedActivityTypesRaw as $activityType) {
+    $activityType = trim((string) $activityType);
+
+    if (
+        isset($activityTypeOptions[$activityType])
+        && !in_array($activityType, $selectedActivityTypes, true)
+    ) {
+        $selectedActivityTypes[] = $activityType;
+    }
 }
 
 $trail = [];
-
 if ($trailRaw !== '') {
     foreach (explode(',', $trailRaw) as $value) {
         $cursor = max(0, (int) $value);
@@ -131,40 +206,49 @@ if ($trailRaw !== '') {
     }
 }
 
-function explorerActivityCondition(string $activityTypeKey, string $scopeKey): string
+function explorerActivityCondition(array $activityTypes, string $scopeKey): string
 {
-    if ($activityTypeKey === 'auth') {
-        return "audit.success = 1 AND audit.event IN ('login', 'logout')";
+    if (empty($activityTypes)) {
+        return $scopeKey === 'all'
+            ? 'audit.success = 1'
+            : EducationAnalytics::meaningfulAuditCondition('audit');
     }
 
-    if ($activityTypeKey === 'patient') {
-        return EducationAnalytics::patientChartAuditCondition('audit');
+    $conditions = [];
+
+    foreach ($activityTypes as $activityType) {
+        if ($activityType === 'auth') {
+            $conditions[] = "audit.success = 1 AND audit.event IN ('login', 'logout')";
+        } elseif ($activityType === 'patient') {
+            $conditions[] = EducationAnalytics::patientChartAuditCondition('audit');
+        } elseif ($activityType === 'clinical') {
+            $conditions[] = "audit.success = 1 AND audit.event IN (
+                'patient-record-insert',
+                'patient-record-update',
+                'patient-record-delete',
+                'patient-record-replace'
+            )";
+        } elseif ($activityType === 'scheduling') {
+            $conditions[] = "audit.success = 1 AND audit.event IN (
+                'scheduling-insert',
+                'scheduling-update',
+                'scheduling-delete'
+            )";
+        } elseif ($activityType === 'sign_print') {
+            $conditions[] = "audit.success = 1 AND audit.event IN ('esign', 'print')";
+        }
     }
 
-    if ($activityTypeKey === 'clinical') {
-        return "audit.success = 1 AND audit.event IN (
-            'patient-record-insert',
-            'patient-record-update',
-            'patient-record-delete',
-            'patient-record-replace'
-        )";
+    if (empty($conditions)) {
+        return $scopeKey === 'all'
+            ? 'audit.success = 1'
+            : EducationAnalytics::meaningfulAuditCondition('audit');
     }
 
-    if ($activityTypeKey === 'scheduling') {
-        return "audit.success = 1 AND audit.event IN (
-            'scheduling-insert',
-            'scheduling-update',
-            'scheduling-delete'
-        )";
-    }
-
-    if ($activityTypeKey === 'sign_print') {
-        return "audit.success = 1 AND audit.event IN ('esign', 'print')";
-    }
-
-    return $scopeKey === 'all'
-        ? 'audit.success = 1'
-        : EducationAnalytics::meaningfulAuditCondition('audit');
+    return '(' . implode(' OR ', array_map(
+        static fn(string $condition): string => '(' . $condition . ')',
+        $conditions
+    )) . ')';
 }
 
 function normalizeExplorerRows(array $rows, string $scopeKey): array
@@ -474,14 +558,17 @@ function renderExplorerTime(array $activity): string
 
 function buildExplorerQuery(array $overrides = []): string
 {
-    global $rangeKey, $scopeKey, $activityTypeKey, $studentFilter;
+    global $rangeKey, $scopeKey, $selectedStudents, $selectedActivityTypes;
     global $patientSearch, $pageSize, $beforeId, $trail;
+    global $customStartDate, $customEndDate;
 
     $values = [
         'range' => $rangeKey,
         'scope' => $scopeKey,
-        'activity_type' => $activityTypeKey,
-        'student' => $studentFilter,
+        'start_date' => $rangeKey === 'custom' ? $customStartDate : '',
+        'end_date' => $rangeKey === 'custom' ? $customEndDate : '',
+        'students' => $selectedStudents,
+        'activity_types' => $selectedActivityTypes,
         'patient' => $patientSearch,
         'page_size' => (string) $pageSize,
         'before_id' => $beforeId > 0 ? (string) $beforeId : '',
@@ -489,37 +576,139 @@ function buildExplorerQuery(array $overrides = []): string
     ];
 
     foreach ($overrides as $key => $value) {
-        $values[$key] = (string) $value;
+        $values[$key] = $value;
     }
 
-    $values = array_filter(
-        $values,
-        static fn(string $value): bool => $value !== ''
-    );
+    foreach ($values as $key => $value) {
+        if ($value === '' || $value === [] || $value === null) {
+            unset($values[$key]);
+        }
+    }
 
     return 'activity-explorer.php?' . http_build_query($values);
 }
 
-$activityCondition = explorerActivityCondition($activityTypeKey, $scopeKey);
-$candidateLimit = 1000;
-$maxChunks = 6;
+function explorerPatientMatches(string $search, bool $canViewDemographics): array
+{
+    if ($search === '') {
+        return [];
+    }
+
+    $patientIds = [];
+
+    if (!$canViewDemographics) {
+        return ctype_digit($search) ? [(int) $search] : [-1];
+    }
+
+    $searchLike = '%' . $search . '%';
+    $statement = sqlStatement(
+        "SELECT pid
+         FROM patient_data
+         WHERE CAST(pid AS CHAR) = ?
+            OR pubpid = ?
+            OR fname LIKE ?
+            OR lname LIKE ?
+            OR CONCAT_WS(' ', fname, mname, lname) LIKE ?
+         ORDER BY pid
+         LIMIT 250",
+        [$search, $search, $searchLike, $searchLike, $searchLike]
+    );
+
+    while ($row = sqlFetchArray($statement)) {
+        $patientId = (int) ($row['pid'] ?? 0);
+
+        if ($patientId > 0) {
+            $patientIds[$patientId] = $patientId;
+        }
+    }
+
+    if (ctype_digit($search) && (int) $search > 0) {
+        $patientIds[(int) $search] = (int) $search;
+    }
+
+    return !empty($patientIds) ? array_values($patientIds) : [-1];
+}
+
+function hydrateExplorerPatients(array &$activities, bool $canViewDemographics): void
+{
+    if (!$canViewDemographics || empty($activities)) {
+        return;
+    }
+
+    $patientIds = [];
+
+    foreach ($activities as $activity) {
+        $patientId = (int) ($activity['patient_id'] ?? 0);
+        if ($patientId > 0) {
+            $patientIds[$patientId] = $patientId;
+        }
+    }
+
+    if (empty($patientIds)) {
+        return;
+    }
+
+    $ids = array_values($patientIds);
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $statement = sqlStatement(
+        "SELECT
+            pid,
+            pubpid,
+            CONCAT_WS(
+                ' ',
+                NULLIF(TRIM(fname), ''),
+                NULLIF(TRIM(mname), ''),
+                NULLIF(TRIM(lname), '')
+            ) AS patient_name
+         FROM patient_data
+         WHERE pid IN ({$placeholders})",
+        $ids
+    );
+
+    $patients = [];
+    while ($row = sqlFetchArray($statement)) {
+        $patientId = (int) ($row['pid'] ?? 0);
+        $patients[$patientId] = [
+            'patient_name' => trim((string) ($row['patient_name'] ?? '')),
+            'pubpid' => trim((string) ($row['pubpid'] ?? ''))
+        ];
+    }
+
+    foreach ($activities as &$activity) {
+        $patientId = (int) ($activity['patient_id'] ?? 0);
+        if ($patientId > 0 && isset($patients[$patientId])) {
+            $activity['patient_name'] = $patients[$patientId]['patient_name'];
+            $activity['pubpid'] = $patients[$patientId]['pubpid'];
+        }
+    }
+    unset($activity);
+}
+
+$activityCondition = explorerActivityCondition($selectedActivityTypes, $scopeKey);
+$patientFilterIds = explorerPatientMatches($patientSearch, $canViewPatientDemographics);
+$candidateLimit = in_array('patient', $selectedActivityTypes, true) ? 1500 : 1000;
+$maxChunks = 16;
 $queryCursor = $beforeId;
 $rawRows = [];
 $lastFetchCount = 0;
 $chunksUsed = 0;
+$scanLimitReached = false;
 
 for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
-    $conditions = [
-        'education_users.track_activity = 1',
-        $activityCondition,
-        $auditRangeCondition
-    ];
+    $conditions = [];
     $params = [];
 
-    if ($studentFilter !== '') {
-        $conditions[] = 'audit.user = ?';
-        $params[] = $studentFilter;
+    if (empty($effectiveStudents)) {
+        $conditions[] = '1 = 0';
+    } else {
+        $studentPlaceholders = implode(',', array_fill(0, count($effectiveStudents), '?'));
+        $conditions[] = "audit.user IN ({$studentPlaceholders})";
+        array_push($params, ...$effectiveStudents);
     }
+
+    $conditions[] = $activityCondition;
+    $conditions[] = $auditRangeCondition;
+    array_push($params, ...$auditRangeParams);
 
     if ($queryCursor > 0) {
         $conditions[] = 'audit.id < ?';
@@ -527,26 +716,9 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
     }
 
     if ($patientSearch !== '') {
-        if ($canViewPatientDemographics) {
-            $searchLike = '%' . $patientSearch . '%';
-            $conditions[] = "(
-                CAST(audit.patient_id AS CHAR) = ?
-                OR patient.pubpid = ?
-                OR patient.fname LIKE ?
-                OR patient.lname LIKE ?
-                OR CONCAT_WS(' ', patient.fname, patient.mname, patient.lname) LIKE ?
-            )";
-            $params[] = $patientSearch;
-            $params[] = $patientSearch;
-            $params[] = $searchLike;
-            $params[] = $searchLike;
-            $params[] = $searchLike;
-        } elseif (ctype_digit($patientSearch)) {
-            $conditions[] = 'audit.patient_id = ?';
-            $params[] = (int) $patientSearch;
-        } else {
-            $conditions[] = '1 = 0';
-        }
+        $patientPlaceholders = implode(',', array_fill(0, count($patientFilterIds), '?'));
+        $conditions[] = "audit.patient_id IN ({$patientPlaceholders})";
+        array_push($params, ...$patientFilterIds);
     }
 
     $whereSql = implode("\n AND ", $conditions);
@@ -557,19 +729,8 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
             audit.event,
             audit.category,
             audit.patient_id,
-            audit.date,
-            patient.pubpid,
-            CONCAT_WS(
-                ' ',
-                NULLIF(TRIM(patient.fname), ''),
-                NULLIF(TRIM(patient.mname), ''),
-                NULLIF(TRIM(patient.lname), '')
-            ) AS patient_name
+            audit.date
          FROM log AS audit
-         INNER JOIN mod_maple_grove_education_users AS education_users
-             ON education_users.username = audit.user
-         LEFT JOIN patient_data AS patient
-             ON patient.pid = audit.patient_id
          WHERE {$whereSql}
          ORDER BY audit.id DESC
          LIMIT {$candidateLimit}",
@@ -577,7 +738,6 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
     );
 
     $chunkRows = [];
-
     while ($row = sqlFetchArray($statement)) {
         $chunkRows[] = $row;
     }
@@ -595,23 +755,30 @@ for ($chunk = 0; $chunk < $maxChunks; $chunk++) {
 
     $previewActivities = normalizeExplorerRows($rawRows, $scopeKey);
 
-    if (count($previewActivities) >= ($pageSize + 10)) {
+    // Keep scanning the already-filtered audit stream until the requested
+    // page is actually full after deduplication/sessionization.
+    if (count($previewActivities) >= ($pageSize + 1)) {
         break;
     }
 
     if ($lastFetchCount < $candidateLimit || $queryCursor <= 0) {
         break;
     }
+
+    if ($chunk === ($maxChunks - 1)) {
+        $scanLimitReached = true;
+    }
 }
 
 $activities = normalizeExplorerRows($rawRows, $scopeKey);
 $displayActivities = array_slice($activities, 0, $pageSize);
+hydrateExplorerPatients($displayActivities, $canViewPatientDemographics);
+
 $hasMore = count($activities) > $pageSize
     || $lastFetchCount === $candidateLimit
-    || $chunksUsed === $maxChunks;
+    || $scanLimitReached;
 
 $nextBeforeId = 0;
-
 if (!empty($displayActivities)) {
     $lastDisplayed = end($displayActivities);
     $nextBeforeId = (int) ($lastDisplayed['first_log_id'] ?? 0);
@@ -671,6 +838,24 @@ $pageNumber = count($trail) + 1;
         .activity-table th {
             vertical-align: middle;
         }
+
+        .filter-checkbox-menu {
+            min-width: 290px;
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .filter-checkbox-menu .custom-control {
+            margin-bottom: 0.35rem;
+        }
+
+        .custom-date-fields {
+            display: none;
+        }
+
+        .custom-date-fields.is-visible {
+            display: flex;
+        }
     </style>
 </head>
 <body class="body_top">
@@ -693,7 +878,12 @@ $pageNumber = count($trail) + 1;
 
         <a
             class="btn btn-outline-secondary mt-2 mt-md-0"
-            href="education-dashboard.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+            href="education-dashboard.php?<?php echo attr(http_build_query(array_filter([
+                'range' => $rangeKey,
+                'scope' => $scopeKey,
+                'start_date' => $rangeKey === 'custom' ? $customStartDate : '',
+                'end_date' => $rangeKey === 'custom' ? $customEndDate : ''
+            ]))); ?>"
             onclick="showActivityLoading()"
         >
             <?php echo xlt('Back to Dashboard'); ?>
@@ -703,22 +893,48 @@ $pageNumber = count($trail) + 1;
     <div class="card shadow-sm mb-3 activity-filter-card">
         <div class="card-body">
             <form method="get" id="activity-filter-form">
-                <div class="form-row">
-                    <div class="form-group col-lg-2 col-md-4">
+                <div class="form-row align-items-end">
+                    <div class="form-group col-xl-2 col-lg-3 col-md-4">
                         <label for="range"><?php echo xlt('Date Range'); ?></label>
                         <select class="form-control" id="range" name="range">
-                            <?php foreach ($rangeOptions as $key => $option) : ?>
+                            <?php foreach ($rangeOptions as $key => $label) : ?>
                                 <option
                                     value="<?php echo attr($key); ?>"
                                     <?php echo (string) $key === $rangeKey ? 'selected' : ''; ?>
                                 >
-                                    <?php echo text($option['label']); ?>
+                                    <?php echo text($label); ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
                     </div>
 
-                    <div class="form-group col-lg-2 col-md-4">
+                    <div
+                        class="form-group col-xl-4 col-lg-5 col-md-8 custom-date-fields <?php echo $rangeKey === 'custom' ? 'is-visible' : ''; ?>"
+                        id="custom-date-fields"
+                    >
+                        <div class="mr-2 flex-fill">
+                            <label for="start_date"><?php echo xlt('Start Date'); ?></label>
+                            <input
+                                class="form-control"
+                                type="date"
+                                id="start_date"
+                                name="start_date"
+                                value="<?php echo attr($customStartDate); ?>"
+                            >
+                        </div>
+                        <div class="flex-fill">
+                            <label for="end_date"><?php echo xlt('End Date'); ?></label>
+                            <input
+                                class="form-control"
+                                type="date"
+                                id="end_date"
+                                name="end_date"
+                                value="<?php echo attr($customEndDate); ?>"
+                            >
+                        </div>
+                    </div>
+
+                    <div class="form-group col-xl-2 col-lg-3 col-md-4">
                         <label for="scope"><?php echo xlt('Audit Scope'); ?></label>
                         <select class="form-control" id="scope" name="scope">
                             <?php foreach ($scopeOptions as $key => $label) : ?>
@@ -732,38 +948,7 @@ $pageNumber = count($trail) + 1;
                         </select>
                     </div>
 
-                    <?php if ($canManageEducation) : ?>
-                        <div class="form-group col-lg-2 col-md-4">
-                            <label for="student"><?php echo xlt('Student'); ?></label>
-                            <select class="form-control" id="student" name="student">
-                                <option value=""><?php echo xlt('All Tracked Students'); ?></option>
-                                <?php foreach ($trackedStudents as $username) : ?>
-                                    <option
-                                        value="<?php echo attr($username); ?>"
-                                        <?php echo $studentFilter === $username ? 'selected' : ''; ?>
-                                    >
-                                        <?php echo text($username); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                    <?php endif; ?>
-
-                    <div class="form-group col-lg-2 col-md-4">
-                        <label for="activity_type"><?php echo xlt('Activity Type'); ?></label>
-                        <select class="form-control" id="activity_type" name="activity_type">
-                            <?php foreach ($activityTypeOptions as $key => $label) : ?>
-                                <option
-                                    value="<?php echo attr($key); ?>"
-                                    <?php echo $activityTypeKey === $key ? 'selected' : ''; ?>
-                                >
-                                    <?php echo text($label); ?>
-                                </option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-
-                    <div class="form-group col-lg-3 col-md-6">
+                    <div class="form-group col-xl-3 col-lg-4 col-md-6">
                         <label for="patient"><?php echo xlt('Patient Search'); ?></label>
                         <input
                             class="form-control"
@@ -775,7 +960,7 @@ $pageNumber = count($trail) + 1;
                         >
                     </div>
 
-                    <div class="form-group col-lg-1 col-md-2">
+                    <div class="form-group col-xl-1 col-lg-2 col-md-2">
                         <label for="page_size"><?php echo xlt('Rows'); ?></label>
                         <select class="form-control" id="page_size" name="page_size">
                             <?php foreach ($pageSizeOptions as $option) : ?>
@@ -790,24 +975,112 @@ $pageNumber = count($trail) + 1;
                     </div>
                 </div>
 
-                <button
-                    class="btn btn-primary mr-2"
-                    type="submit"
-                    onclick="showActivityLoading()"
-                >
-                    <?php echo xlt('Apply Filters'); ?>
-                </button>
+                <div class="d-flex flex-wrap align-items-start mb-3">
+                    <?php if ($canManageEducation) : ?>
+                        <div class="dropdown mr-2 mb-2">
+                            <button
+                                class="btn btn-outline-secondary dropdown-toggle"
+                                type="button"
+                                data-toggle="dropdown"
+                                aria-haspopup="true"
+                                aria-expanded="false"
+                            >
+                                <?php
+                                echo text(
+                                    empty($selectedStudents)
+                                        ? 'Students: All tracked'
+                                        : 'Students: ' . count($selectedStudents) . ' selected'
+                                );
+                                ?>
+                            </button>
+                            <div class="dropdown-menu p-3 filter-checkbox-menu">
+                                <div class="small text-muted mb-2">
+                                    Leave all unchecked to include every tracked student.
+                                </div>
+                                <?php foreach ($trackedStudents as $username) : ?>
+                                    <?php $checkboxId = 'student-' . md5($username); ?>
+                                    <div class="custom-control custom-checkbox">
+                                        <input
+                                            class="custom-control-input"
+                                            type="checkbox"
+                                            id="<?php echo attr($checkboxId); ?>"
+                                            name="students[]"
+                                            value="<?php echo attr($username); ?>"
+                                            <?php echo in_array($username, $selectedStudents, true) ? 'checked' : ''; ?>
+                                        >
+                                        <label class="custom-control-label" for="<?php echo attr($checkboxId); ?>">
+                                            <?php echo text($username); ?>
+                                        </label>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+                    <?php endif; ?>
 
-                <a
-                    class="btn btn-outline-secondary"
-                    href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=meaningful"
-                    onclick="showActivityLoading()"
-                >
-                    <?php echo xlt('Reset Filters'); ?>
-                </a>
+                    <div class="dropdown mr-2 mb-2">
+                        <button
+                            class="btn btn-outline-secondary dropdown-toggle"
+                            type="button"
+                            data-toggle="dropdown"
+                            aria-haspopup="true"
+                            aria-expanded="false"
+                        >
+                            <?php
+                            echo text(
+                                empty($selectedActivityTypes)
+                                    ? 'Activities: All'
+                                    : 'Activities: ' . count($selectedActivityTypes) . ' selected'
+                            );
+                            ?>
+                        </button>
+                        <div class="dropdown-menu p-3 filter-checkbox-menu">
+                            <div class="small text-muted mb-2">
+                                Leave all unchecked to include every activity type in the selected audit scope.
+                            </div>
+                            <?php foreach ($activityTypeOptions as $key => $label) : ?>
+                                <?php $checkboxId = 'activity-' . $key; ?>
+                                <div class="custom-control custom-checkbox">
+                                    <input
+                                        class="custom-control-input"
+                                        type="checkbox"
+                                        id="<?php echo attr($checkboxId); ?>"
+                                        name="activity_types[]"
+                                        value="<?php echo attr($key); ?>"
+                                        <?php echo in_array($key, $selectedActivityTypes, true) ? 'checked' : ''; ?>
+                                    >
+                                    <label class="custom-control-label" for="<?php echo attr($checkboxId); ?>">
+                                        <?php echo text($label); ?>
+                                    </label>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
+
+                    <button
+                        class="btn btn-primary mr-2 mb-2"
+                        type="submit"
+                        onclick="showActivityLoading()"
+                    >
+                        <?php echo xlt('Apply Filters'); ?>
+                    </button>
+
+                    <a
+                        class="btn btn-outline-secondary mb-2"
+                        href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey === 'custom' ? '7' : $rangeKey)); ?>&amp;scope=meaningful"
+                        onclick="showActivityLoading()"
+                    >
+                        <?php echo xlt('Reset Filters'); ?>
+                    </a>
+                </div>
             </form>
         </div>
     </div>
+
+    <?php if ($dateRangeMessage !== '') : ?>
+        <div class="alert alert-warning py-2">
+            <?php echo text($dateRangeMessage); ?>
+        </div>
+    <?php endif; ?>
 
     <?php if ($scopeKey === 'meaningful') : ?>
         <div class="alert alert-info py-2">
@@ -816,6 +1089,12 @@ $pageNumber = count($trail) + 1;
     <?php else : ?>
         <div class="alert alert-warning py-2">
             Raw audit mode can contain substantial OpenEMR background and technical activity.
+        </div>
+    <?php endif; ?>
+
+    <?php if ($scanLimitReached && count($displayActivities) < $pageSize) : ?>
+        <div class="alert alert-warning py-2">
+            The explorer reached its bounded audit scan limit before filling this page. Narrow the date, student, activity, or patient filters for a complete page.
         </div>
     <?php endif; ?>
 
@@ -969,6 +1248,31 @@ function showActivityLoading() {
 }
 
 document.addEventListener("DOMContentLoaded", function () {
+    const rangeSelect = document.getElementById("range");
+    const customDateFields = document.getElementById("custom-date-fields");
+
+    const updateCustomDateVisibility = function () {
+        if (!rangeSelect || !customDateFields) {
+            return;
+        }
+
+        customDateFields.classList.toggle(
+            "is-visible",
+            rangeSelect.value === "custom"
+        );
+    };
+
+    if (rangeSelect) {
+        rangeSelect.addEventListener("change", updateCustomDateVisibility);
+        updateCustomDateVisibility();
+    }
+
+    document.querySelectorAll(".filter-checkbox-menu").forEach(function (menu) {
+        menu.addEventListener("click", function (event) {
+            event.stopPropagation();
+        });
+    });
+
     const timestampRangePattern =
         /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\s+–\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}))?$/;
 

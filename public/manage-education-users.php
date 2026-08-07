@@ -21,8 +21,10 @@ $canManageEducation = EducationAnalytics::canManageEducation($currentUserId);
 
 $returnRange = (string) ($_GET['return_range'] ?? '7');
 $returnScope = (string) ($_GET['return_scope'] ?? 'meaningful');
+$returnStartDate = trim((string) ($_GET['return_start_date'] ?? ''));
+$returnEndDate = trim((string) ($_GET['return_end_date'] ?? ''));
 
-if (!in_array($returnRange, ['today', '7', '30', 'all'], true)) {
+if (!in_array($returnRange, ['today', '7', '30', 'all', 'custom'], true)) {
     $returnRange = '7';
 }
 
@@ -30,10 +32,20 @@ if (!in_array($returnScope, ['meaningful', 'all'], true)) {
     $returnScope = 'meaningful';
 }
 
-$dashboardReturnUrl = 'education-dashboard.php?range='
-    . rawurlencode($returnRange)
-    . '&scope='
-    . rawurlencode($returnScope);
+$returnDatePattern = '/^\\d{4}-\\d{2}-\\d{2}$/';
+if (!preg_match($returnDatePattern, $returnStartDate)) {
+    $returnStartDate = '';
+}
+if (!preg_match($returnDatePattern, $returnEndDate)) {
+    $returnEndDate = '';
+}
+
+$dashboardReturnUrl = 'education-dashboard.php?' . http_build_query(array_filter([
+    'range' => $returnRange,
+    'scope' => $returnScope,
+    'start_date' => $returnRange === 'custom' ? $returnStartDate : '',
+    'end_date' => $returnRange === 'custom' ? $returnEndDate : ''
+]));
 
 if (!$canManageEducation) {
     http_response_code(403);

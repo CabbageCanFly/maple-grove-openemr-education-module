@@ -31,26 +31,11 @@ EducationAnalytics::recordTrackedEvent(
 );
 
 $rangeOptions = [
-    'today' => [
-        'label' => 'Today',
-        'audit_condition' => 'audit.date >= CURDATE()',
-        'module_condition' => 'events.created_at >= CURDATE()'
-    ],
-    '7' => [
-        'label' => 'Last 7 Days',
-        'audit_condition' => 'audit.date >= DATE_SUB(NOW(), INTERVAL 7 DAY)',
-        'module_condition' => 'events.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)'
-    ],
-    '30' => [
-        'label' => 'Last 30 Days',
-        'audit_condition' => 'audit.date >= DATE_SUB(NOW(), INTERVAL 30 DAY)',
-        'module_condition' => 'events.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)'
-    ],
-    'all' => [
-        'label' => 'All Available History',
-        'audit_condition' => '1 = 1',
-        'module_condition' => '1 = 1'
-    ]
+    'today' => 'Today',
+    '7' => 'Last 7 Days',
+    '30' => 'Last 30 Days',
+    'all' => 'All Available History',
+    'custom' => 'Custom Dates'
 ];
 
 $scopeOptions = [
@@ -58,8 +43,22 @@ $scopeOptions = [
     'all' => 'All Successful Audit Events'
 ];
 
+function dashboardValidDate(string $value): bool
+{
+    if (!preg_match('/^\\d{4}-\\d{2}-\\d{2}$/', $value)) {
+        return false;
+    }
+
+    $date = DateTime::createFromFormat('!Y-m-d', $value);
+
+    return $date !== false && $date->format('Y-m-d') === $value;
+}
+
 $rangeKey = (string) ($_GET['range'] ?? '7');
 $scopeKey = (string) ($_GET['scope'] ?? 'meaningful');
+$customStartDate = trim((string) ($_GET['start_date'] ?? ''));
+$customEndDate = trim((string) ($_GET['end_date'] ?? ''));
+$dateRangeMessage = '';
 
 if (!isset($rangeOptions[$rangeKey])) {
     $rangeKey = '7';
@@ -69,9 +68,49 @@ if (!isset($scopeOptions[$scopeKey])) {
     $scopeKey = 'meaningful';
 }
 
-$rangeLabel = $rangeOptions[$rangeKey]['label'];
-$auditRangeCondition = $rangeOptions[$rangeKey]['audit_condition'];
-$moduleRangeCondition = $rangeOptions[$rangeKey]['module_condition'];
+if (!dashboardValidDate($customStartDate)) {
+    $customStartDate = date('Y-m-d', strtotime('-6 days'));
+}
+
+if (!dashboardValidDate($customEndDate)) {
+    $customEndDate = date('Y-m-d');
+}
+
+if ($customStartDate > $customEndDate) {
+    [$customStartDate, $customEndDate] = [$customEndDate, $customStartDate];
+    if ($rangeKey === 'custom') {
+        $dateRangeMessage = 'Start and end dates were reversed so the earlier date comes first.';
+    }
+}
+
+$rangeLabel = $rangeOptions[$rangeKey];
+
+if ($rangeKey === 'custom') {
+    // Both values are strict YYYY-MM-DD dates at this point, so interpolation
+    // cannot introduce arbitrary SQL. The end date is inclusive.
+    $auditRangeCondition = "audit.date >= '{$customStartDate} 00:00:00'\n        AND audit.date < DATE_ADD('{$customEndDate} 00:00:00', INTERVAL 1 DAY)";
+    $moduleRangeCondition = "events.created_at >= '{$customStartDate} 00:00:00'\n        AND events.created_at < DATE_ADD('{$customEndDate} 00:00:00', INTERVAL 1 DAY)";
+    $rangeLabel = $customStartDate . ' – ' . $customEndDate;
+} elseif ($rangeKey === 'today') {
+    $auditRangeCondition = 'audit.date >= CURDATE()';
+    $moduleRangeCondition = 'events.created_at >= CURDATE()';
+} elseif ($rangeKey === '7') {
+    $auditRangeCondition = 'audit.date >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+    $moduleRangeCondition = 'events.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+} elseif ($rangeKey === '30') {
+    $auditRangeCondition = 'audit.date >= DATE_SUB(NOW(), INTERVAL 30 DAY)';
+    $moduleRangeCondition = 'events.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)';
+} else {
+    $auditRangeCondition = '1 = 1';
+    $moduleRangeCondition = '1 = 1';
+}
+
+$sharedRangeQuery = http_build_query(array_filter([
+    'range' => $rangeKey,
+    'scope' => $scopeKey,
+    'start_date' => $rangeKey === 'custom' ? $customStartDate : '',
+    'end_date' => $rangeKey === 'custom' ? $customEndDate : ''
+]));
 
 $auditScopeCondition = $scopeKey === 'all'
     ? 'audit.success = 1'
@@ -432,7 +471,7 @@ if ($canManageEducation) {
 
     $cacheKey = hash(
         'sha256',
-        implode('|', $trackedStudents) . '|' . $rangeKey . '|' . $scopeKey
+        implode('|', $trackedStudents) . '|' . $rangeKey . '|' . $scopeKey . '|' . $customStartDate . '|' . $customEndDate
     );
     $cacheTtlSeconds = 60;
     $cachedAnalytics = $_SESSION['maple_grove_education_analytics_cache'][$cacheKey] ?? null;
@@ -1128,6 +1167,14 @@ function renderAuditTime(array $event): string
             border-radius: 0.4rem;
             box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.12);
         }
+        .dashboard-custom-date-fields {
+            display: none;
+            align-items: flex-end;
+        }
+
+        .dashboard-custom-date-fields.is-visible {
+            display: flex;
+        }
     </style>
 </head>
 
@@ -1156,7 +1203,7 @@ function renderAuditTime(array $event): string
             <?php if ($canManageEducation || $isTrackedStudent) : ?>
                 <a
                     class="btn btn-primary mr-2"
-                    href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                    href="activity-explorer.php?<?php echo attr($sharedRangeQuery); ?>"
                     onclick="showDashboardLoading()"
                 >
                     <?php echo xlt('Explore Activity'); ?>
@@ -1166,7 +1213,12 @@ function renderAuditTime(array $event): string
             <?php if ($canManageEducation) : ?>
                 <a
                     class="btn btn-outline-primary mr-2"
-                    href="manage-education-users.php?return_range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;return_scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                    href="manage-education-users.php?<?php echo attr(http_build_query(array_filter([
+                        'return_range' => $rangeKey,
+                        'return_scope' => $scopeKey,
+                        'return_start_date' => $rangeKey === 'custom' ? $customStartDate : '',
+                        'return_end_date' => $rangeKey === 'custom' ? $customEndDate : ''
+                    ]))); ?>"
                 >
                     <?php echo xlt('Manage Education Users'); ?>
                 </a>
@@ -1187,17 +1239,50 @@ function renderAuditTime(array $event): string
             class="form-control mr-3"
             id="range"
             name="range"
-            onchange="showDashboardLoading(); this.form.submit()"
+            onchange="handleDashboardRangeChange(this)"
         >
-            <?php foreach ($rangeOptions as $key => $option) : ?>
+            <?php foreach ($rangeOptions as $key => $label) : ?>
                 <option
                     value="<?php echo attr($key); ?>"
                     <?php echo (string) $key === $rangeKey ? 'selected' : ''; ?>
                 >
-                    <?php echo text($option['label']); ?>
+                    <?php echo text($label); ?>
                 </option>
             <?php endforeach; ?>
         </select>
+
+        <div
+            class="dashboard-custom-date-fields mr-3 <?php echo $rangeKey === 'custom' ? 'is-visible' : ''; ?>"
+            id="dashboard-custom-date-fields"
+        >
+            <div class="mr-2">
+                <label for="start_date" class="small mb-0 d-block"><?php echo xlt('Start'); ?></label>
+                <input
+                    class="form-control"
+                    type="date"
+                    id="start_date"
+                    name="start_date"
+                    value="<?php echo attr($customStartDate); ?>"
+                >
+            </div>
+            <div class="mr-2">
+                <label for="end_date" class="small mb-0 d-block"><?php echo xlt('End'); ?></label>
+                <input
+                    class="form-control"
+                    type="date"
+                    id="end_date"
+                    name="end_date"
+                    value="<?php echo attr($customEndDate); ?>"
+                >
+            </div>
+            <button
+                class="btn btn-primary"
+                type="submit"
+                onclick="showDashboardLoading()"
+            >
+                <?php echo xlt('Apply Dates'); ?>
+            </button>
+        </div>
 
         <label for="scope" class="mr-2">
             <strong><?php echo xlt('Audit Scope'); ?></strong>
@@ -1226,11 +1311,10 @@ function renderAuditTime(array $event): string
         </noscript>
     </form>
 
-    <?php if ($canManageEducation) : ?>
-        <p class="small text-muted mt-n2 mb-3">
-            Dashboard results are reused for up to 60 seconds to make returning
-            to this page faster.
-        </p>
+    <?php if ($dateRangeMessage !== '') : ?>
+        <div class="alert alert-warning py-2">
+            <?php echo text($dateRangeMessage); ?>
+        </div>
     <?php endif; ?>
 
     <?php if ($scopeKey === 'all') : ?>
@@ -1429,7 +1513,7 @@ function renderAuditTime(array $event): string
                         </strong>
                         <a
                             class="btn btn-sm btn-outline-primary mt-1 mt-sm-0"
-                            href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                            href="activity-explorer.php?<?php echo attr($sharedRangeQuery); ?>"
                             onclick="showDashboardLoading()"
                         >
                             <?php echo xlt('Browse All Activity'); ?>
@@ -1671,7 +1755,7 @@ function renderAuditTime(array $event): string
                 </strong>
                 <a
                     class="btn btn-sm btn-outline-primary mt-1 mt-sm-0"
-                    href="activity-explorer.php?range=<?php echo attr(rawurlencode($rangeKey)); ?>&amp;scope=<?php echo attr(rawurlencode($scopeKey)); ?>"
+                    href="activity-explorer.php?<?php echo attr($sharedRangeQuery); ?>"
                     onclick="showDashboardLoading()"
                 >
                     <?php echo xlt('Browse All Activity'); ?>
@@ -1773,6 +1857,24 @@ function openPatientDashboard(patientId, fallbackUrl) {
 
     window.location.href = fallbackUrl;
     return false;
+}
+
+function handleDashboardRangeChange(select) {
+    const customFields = document.getElementById("dashboard-custom-date-fields");
+
+    if (select.value === "custom") {
+        if (customFields) {
+            customFields.classList.add("is-visible");
+        }
+        return;
+    }
+
+    if (customFields) {
+        customFields.classList.remove("is-visible");
+    }
+
+    showDashboardLoading();
+    select.form.submit();
 }
 
 function showDashboardLoading() {
