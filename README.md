@@ -4,6 +4,44 @@ A custom OpenEMR module for the Maple Grove educational clinic environment.
 
 The module adds education-focused activity analytics directly inside OpenEMR. It uses OpenEMR's existing audit history together with small module-owned tables so instructors can review student activity while tracked students can review their own activity.
 
+## Quick Install on an Existing OpenEMR Docker Host
+
+On the OpenEMR server:
+
+```bash
+cd ~
+
+git clone https://github.com/CabbageCanFly/maple-grove-openemr-education-module.git
+
+cd maple-grove-openemr-education-module
+
+sudo docker cp \
+  . \
+  lightsail_openemr_1:/var/www/localhost/htdocs/openemr/interface/modules/custom_modules/maple-grove-openemr-education-module
+```
+
+If the OpenEMR container is not named `lightsail_openemr_1`, check it first with:
+
+```bash
+sudo docker ps --format '{{.Names}}'
+```
+
+Then in OpenEMR:
+
+1. **Modules -> Manage Modules -> Unregistered**
+2. **Register -> Install -> Enable**
+3. **Administration -> Config -> Maple Grove Education**
+4. Enable **Education Dashboard menu item** and click **Save**
+5. Log out/in if the menu item does not appear immediately
+
+Open the module from:
+
+```text
+Modules -> Education Dashboard
+```
+
+For detailed AWS/test deployment and verification steps, see [`docs/AWS_TEST_DEPLOYMENT.md`](docs/AWS_TEST_DEPLOYMENT.md).
+
 ## Current Status
 
 The activity-analytics MVP is implemented and has been tested locally and on disposable AWS clones of the class OpenEMR environment.
