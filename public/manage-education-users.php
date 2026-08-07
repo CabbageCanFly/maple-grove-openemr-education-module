@@ -295,7 +295,55 @@ if ($canManageEducation) {
 
             <div class="card shadow-sm">
                 <div class="card-header">
-                    <strong><?php echo xlt('OpenEMR Accounts'); ?></strong>
+                    <div class="d-flex flex-wrap justify-content-between align-items-center">
+                        <strong><?php echo xlt('OpenEMR Accounts'); ?></strong>
+
+                        <div class="mt-2 mt-md-0">
+                            <button
+                                type="button"
+                                class="btn btn-sm btn-outline-primary mr-1"
+                                onclick="setVisibleStudentTracking(true)"
+                            >
+                                <?php echo xlt('Select Visible Students'); ?>
+                            </button>
+                            <button
+                                type="button"
+                                class="btn btn-sm btn-outline-secondary"
+                                onclick="setVisibleStudentTracking(false)"
+                            >
+                                <?php echo xlt('Clear Visible Students'); ?>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="form-row align-items-center mt-3">
+                        <div class="col-md-6 col-lg-4">
+                            <label class="sr-only" for="education-user-search">
+                                <?php echo xlt('Search users'); ?>
+                            </label>
+                            <input
+                                type="search"
+                                class="form-control form-control-sm"
+                                id="education-user-search"
+                                placeholder="<?php echo attr(xlt('Search by name or username…')); ?>"
+                                oninput="filterEducationUsers()"
+                            >
+                        </div>
+                        <div class="col-auto mt-2 mt-md-0">
+                            <button
+                                type="button"
+                                class="btn btn-sm btn-link"
+                                onclick="clearEducationUserSearch()"
+                            >
+                                <?php echo xlt('Clear Search'); ?>
+                            </button>
+                        </div>
+                        <div class="col-auto mt-2 mt-md-0 small text-muted" id="education-user-search-count"></div>
+                    </div>
+
+                    <div class="small text-muted mt-2">
+                        <?php echo xlt('Bulk student actions affect only accounts currently visible in the table. Analytics-viewer permissions are never changed by these buttons.'); ?>
+                    </div>
                 </div>
 
                 <div class="table-responsive">
@@ -330,7 +378,10 @@ if ($canManageEducation) {
                             }
                             ?>
 
-                            <tr>
+                            <tr
+                                class="education-user-row"
+                                data-user-search="<?php echo attr(strtolower($fullName . ' ' . ($user['username'] ?? ''))); ?>"
+                            >
                                 <td><?php echo text($fullName); ?></td>
                                 <td>
                                     <code>
@@ -351,6 +402,7 @@ if ($canManageEducation) {
                                 <td class="text-center">
                                     <input
                                         type="checkbox"
+                                        class="track-activity-checkbox"
                                         name="track_activity[]"
                                         value="<?php echo attr($userId); ?>"
                                         <?php
@@ -399,6 +451,57 @@ function showDashboardLoading() {
         overlay.classList.add("is-visible");
     }
 }
+
+function educationUserRows() {
+    return Array.from(document.querySelectorAll(".education-user-row"));
+}
+
+function filterEducationUsers() {
+    const input = document.getElementById("education-user-search");
+    const count = document.getElementById("education-user-search-count");
+    const query = input ? input.value.trim().toLowerCase() : "";
+    let visible = 0;
+
+    educationUserRows().forEach(function (row) {
+        const haystack = (row.getAttribute("data-user-search") || "").toLowerCase();
+        const matches = query === "" || haystack.indexOf(query) !== -1;
+
+        row.style.display = matches ? "" : "none";
+        if (matches) {
+            visible += 1;
+        }
+    });
+
+    if (count) {
+        count.textContent = visible + " account" + (visible === 1 ? "" : "s") + " shown";
+    }
+}
+
+function clearEducationUserSearch() {
+    const input = document.getElementById("education-user-search");
+
+    if (input) {
+        input.value = "";
+        input.focus();
+    }
+
+    filterEducationUsers();
+}
+
+function setVisibleStudentTracking(checked) {
+    educationUserRows().forEach(function (row) {
+        if (row.style.display === "none") {
+            return;
+        }
+
+        const checkbox = row.querySelector(".track-activity-checkbox");
+        if (checkbox) {
+            checkbox.checked = checked;
+        }
+    });
+}
+
+filterEducationUsers();
 </script>
 
 </body>
