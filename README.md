@@ -6,6 +6,8 @@ The module adds education-focused activity analytics directly inside OpenEMR. It
 
 ## Quick Install on an Existing OpenEMR Docker Host
 
+Note: These instructions are specifically for the OpenEMR 7.0.2 AWS Marketplace Docker deployment for the Maple Grove class environment
+
 On the OpenEMR server:
 
 ```bash
