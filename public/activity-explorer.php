@@ -926,125 +926,94 @@ if ($scopeKey === 'all') {
     $patientActivities = [];
 
     if (explorerIncludesPatientSessions($selectedActivityTypes)) {
-        [$patientConditions, $patientParams] = $buildBaseConditions(
-            $effectiveStudents,
-            $auditRangeCondition,
-            $auditRangeParams,
-            0,
-            EducationAnalytics::patientChartAuditCondition('audit'),
-            $patientSearch,
-            $patientFilterIds
-        );
+        // Keep this compatible with older MySQL/MariaDB releases used by some
+        // OpenEMR deployments. Do not rely on CTEs or window functions here.
+        // Instead, query only patient-chart audit rows (plus the small patient
+        // creation bundle needed for noise suppression) in bounded chunks and
+        // sessionize them in PHP.
+        $patientChartCondition = EducationAnalytics::patientChartAuditCondition('audit');
+        $patientCreationCondition = "audit.success = 1
+            AND audit.event = 'patient-record-insert'
+            AND audit.category IN (
+                'Patient Demographics',
+                'Patient Insurance',
+                'Social and Family History'
+            )";
+        $patientStreamCondition = "(({$patientChartCondition}) OR ({$patientCreationCondition}))";
 
-        $patientWhereSql = implode("\n AND ", $patientConditions);
-        $sessionCursorCondition = '';
+        $patientCandidateLimit = max(1500, $pageSize * 25);
+        $patientMaxChunks = 30;
+        $patientQueryCursor = $beforeId;
+        $rawPatientRows = [];
+        $patientLastFetchCount = 0;
 
-        if ($beforeId > 0) {
-            $sessionCursorCondition = 'AND sessions.last_log_id < ?';
-            $patientParams[] = $beforeId;
-        }
+        for ($chunk = 0; $chunk < $patientMaxChunks; $chunk++) {
+            [$patientConditions, $patientParams] = $buildBaseConditions(
+                $effectiveStudents,
+                $auditRangeCondition,
+                $auditRangeParams,
+                $patientQueryCursor,
+                $patientStreamCondition,
+                $patientSearch,
+                $patientFilterIds
+            );
 
-        $sessionLimit = $pageSize + 1;
-        $patientStatement = sqlStatement(
-            "WITH patient_reads AS (
-                SELECT
+            $patientWhereSql = implode("\n AND ", $patientConditions);
+            $patientStatement = sqlStatement(
+                "SELECT
                     audit.id,
                     audit.user,
+                    audit.event,
+                    audit.category,
                     audit.patient_id,
-                    audit.date,
-                    LAG(audit.date) OVER (
-                        PARTITION BY audit.user, audit.patient_id
-                        ORDER BY audit.date ASC, audit.id ASC
-                    ) AS previous_date
-                FROM log AS audit
-                WHERE {$patientWhereSql}
-            ),
-            session_marks AS (
-                SELECT
-                    id,
-                    user,
-                    patient_id,
-                    date,
-                    CASE
-                        WHEN previous_date IS NULL
-                          OR TIMESTAMPDIFF(SECOND, previous_date, date) > 1800
-                        THEN 1
-                        ELSE 0
-                    END AS new_session
-                FROM patient_reads
-            ),
-            sessionized AS (
-                SELECT
-                    id,
-                    user,
-                    patient_id,
-                    date,
-                    SUM(new_session) OVER (
-                        PARTITION BY user, patient_id
-                        ORDER BY date ASC, id ASC
-                        ROWS UNBOUNDED PRECEDING
-                    ) AS session_number
-                FROM session_marks
-            ),
-            patient_sessions AS (
-                SELECT
-                    user,
-                    patient_id,
-                    MIN(date) AS session_start,
-                    MAX(date) AS date,
-                    COUNT(*) AS repeated_count,
-                    MIN(id) AS first_log_id,
-                    MAX(id) AS last_log_id
-                FROM sessionized
-                GROUP BY user, patient_id, session_number
-            )
-            SELECT
-                sessions.user,
-                'patient-chart-session' AS event,
-                'Patient Chart' AS category,
-                sessions.patient_id,
-                sessions.session_start,
-                sessions.date,
-                sessions.repeated_count,
-                sessions.first_log_id,
-                sessions.last_log_id
-            FROM patient_sessions AS sessions
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM log AS created
-                WHERE created.user = sessions.user
-                  AND created.patient_id = sessions.patient_id
-                  AND created.success = 1
-                  AND created.event = 'patient-record-insert'
-                  AND created.category IN (
-                      'Patient Demographics',
-                      'Patient Insurance',
-                      'Social and Family History'
-                  )
-                  AND created.date BETWEEN
-                      DATE_SUB(sessions.session_start, INTERVAL 60 SECOND)
-                      AND DATE_ADD(sessions.date, INTERVAL 60 SECOND)
-            )
-            {$sessionCursorCondition}
-            ORDER BY sessions.date DESC, sessions.last_log_id DESC
-            LIMIT {$sessionLimit}",
-            $patientParams
-        );
+                    audit.date
+                 FROM log AS audit
+                 WHERE {$patientWhereSql}
+                 ORDER BY audit.id DESC
+                 LIMIT {$patientCandidateLimit}",
+                $patientParams
+            );
 
-        while ($row = sqlFetchArray($patientStatement)) {
-            $patientActivities[] = [
-                'user' => (string) ($row['user'] ?? ''),
-                'event' => 'patient-chart-session',
-                'category' => 'Patient Chart',
-                'patient_id' => (int) ($row['patient_id'] ?? 0),
-                'session_start' => (string) ($row['session_start'] ?? ''),
-                'date' => (string) ($row['date'] ?? ''),
-                'repeated_count' => (int) ($row['repeated_count'] ?? 0),
-                'first_log_id' => (int) ($row['first_log_id'] ?? 0),
-                'last_log_id' => (int) ($row['last_log_id'] ?? 0),
-                'patient_name' => '',
-                'pubpid' => ''
-            ];
+            $patientChunkRows = [];
+            while ($row = sqlFetchArray($patientStatement)) {
+                $patientChunkRows[] = $row;
+            }
+
+            $patientLastFetchCount = count($patientChunkRows);
+
+            if ($patientLastFetchCount === 0) {
+                break;
+            }
+
+            array_push($rawPatientRows, ...$patientChunkRows);
+            $lastPatientRow = end($patientChunkRows);
+            $patientQueryCursor = (int) ($lastPatientRow['id'] ?? 0);
+
+            $normalizedPatientRows = normalizeExplorerRows(
+                $rawPatientRows,
+                'meaningful'
+            );
+            $patientActivities = array_values(array_filter(
+                $normalizedPatientRows,
+                static function (array $activity): bool {
+                    return ($activity['event'] ?? '') === 'patient-chart-session';
+                }
+            ));
+
+            if (count($patientActivities) >= ($pageSize + 1)) {
+                break;
+            }
+
+            if (
+                $patientLastFetchCount < $patientCandidateLimit
+                || $patientQueryCursor <= 0
+            ) {
+                break;
+            }
+
+            if ($chunk === ($patientMaxChunks - 1)) {
+                $scanLimitReached = true;
+            }
         }
     }
 
@@ -1074,12 +1043,10 @@ hydrateExplorerPatients($displayActivities, $canViewPatientDemographics);
 $nextBeforeId = 0;
 if (!empty($displayActivities)) {
     $lastDisplayed = end($displayActivities);
-
-    if (($lastDisplayed['event'] ?? '') === 'patient-chart-session') {
-        $nextBeforeId = (int) ($lastDisplayed['last_log_id'] ?? 0);
-    } else {
-        $nextBeforeId = (int) ($lastDisplayed['first_log_id'] ?? 0);
-    }
+    // The compatibility-safe explorer scans raw audit rows by descending id.
+    // Continue strictly before the oldest raw row represented by the last
+    // displayed activity to avoid replaying part of that activity next page.
+    $nextBeforeId = (int) ($lastDisplayed['first_log_id'] ?? 0);
 }
 
 $currentCursorForTrail = $beforeId > 0 ? $beforeId : 0;
