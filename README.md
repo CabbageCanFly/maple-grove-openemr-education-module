@@ -1,5 +1,7 @@
 # Maple Grove OpenEMR Education Module
 
+![Sample Screenshot](docs/screenshots/sample-screenshot.png)
+
 A custom OpenEMR module for the Maple Grove educational clinic environment.
 
 The module adds education-focused activity analytics directly inside OpenEMR. It uses OpenEMR's existing audit history together with small module-owned tables so instructors can review student activity while tracked students can review their own activity.
